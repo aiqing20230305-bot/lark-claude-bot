@@ -26,18 +26,44 @@ let tokenExpiresAt = 0; // ms
 
 // Refresh user access token using refresh token
 async function refreshUserToken() {
+  // Step 1: get app_access_token
+  const appRes = await fetch("https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      app_id: process.env.LARK_APP_ID,
+      app_secret: process.env.LARK_APP_SECRET,
+    }),
+  });
+  const appText = await appRes.text();
+  let aat;
+  try {
+    aat = JSON.parse(appText).app_access_token;
+  } catch {
+    console.error("[Token] 获取 app_access_token 失败:", appText.slice(0, 200));
+    return;
+  }
+
+  // Step 2: refresh user token using app_access_token as Bearer
   const res = await fetch("https://open.feishu.cn/open-apis/authen/v2/oidc/refresh_access_token", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Basic ${Buffer.from(`${process.env.LARK_APP_ID}:${process.env.LARK_APP_SECRET}`).toString("base64")}`,
+      Authorization: `Bearer ${aat}`,
     },
     body: JSON.stringify({
       grant_type: "refresh_token",
       refresh_token: userRefreshToken,
     }),
   });
-  const data = await res.json();
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    console.error("[Token] 刷新接口返回非 JSON:", text.slice(0, 200));
+    return;
+  }
   const token = data.data || data;
   if (token.access_token) {
     userAccessToken = token.access_token;
@@ -45,7 +71,7 @@ async function refreshUserToken() {
     tokenExpiresAt = Date.now() + (token.expires_in || 7200) * 1000 - 60000;
     console.log("[Token] 刷新成功，有效期至:", new Date(tokenExpiresAt).toLocaleString("zh-CN"));
   } else {
-    console.error("[Token] 刷新失败:", JSON.stringify(data));
+    console.error("[Token] 刷新失败:", text.slice(0, 300));
   }
 }
 
