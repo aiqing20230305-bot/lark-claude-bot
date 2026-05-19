@@ -350,6 +350,254 @@ async function getDepartmentMembers(departmentId) {
   return data;
 }
 
+// ── Message management ──────────────────────────────────────────────────────
+
+async function deleteMessage(messageId) {
+  const data = await userApiCall(`/open-apis/im/v1/messages/${messageId}`, "DELETE");
+  return data.code === 0 ? "消息已删除" : `删除失败: ${data.msg}`;
+}
+
+async function getChatMembers(chatId) {
+  const data = await userApiCall(`/open-apis/im/v1/chats/${chatId}/members?page_size=50`);
+  if (data.data?.items) {
+    return data.data.items.map((m) => ({ name: m.name, open_id: m.member_id }));
+  }
+  return data;
+}
+
+async function pinMessage(chatId, messageId) {
+  const data = await userApiCall("/open-apis/im/v1/pins", "POST", { message_id: messageId });
+  return data.code === 0 ? "消息已置顶" : `置顶失败: ${data.msg}`;
+}
+
+async function addReaction(messageId, reactionType) {
+  const data = await userApiCall(`/open-apis/im/v1/messages/${messageId}/reactions`, "POST", {
+    reaction_type: { emoji_type: reactionType },
+  });
+  return data.code === 0 ? "表情回应已添加" : `失败: ${data.msg}`;
+}
+
+async function forwardMessage(messageId, chatId) {
+  const data = await userApiCall(`/open-apis/im/v1/messages/${messageId}/forward`, "POST", {
+    receive_id: chatId,
+    receive_id_type: "chat_id",
+  });
+  return data.code === 0 ? "消息已转发" : `转发失败: ${data.msg}`;
+}
+
+// ── Group management ─────────────────────────────────────────────────────────
+
+async function createGroup(name, openIds = []) {
+  const body = { name, chat_type: "group" };
+  if (openIds.length) body.user_id_list = openIds;
+  const data = await userApiCall("/open-apis/im/v1/chats", "POST", body);
+  if (data.data?.chat_id) return { success: true, chat_id: data.data.chat_id, name: data.data.name };
+  return data;
+}
+
+async function addGroupMember(chatId, openIds) {
+  const data = await userApiCall(`/open-apis/im/v1/chats/${chatId}/members`, "POST", {
+    id_list: openIds,
+    member_id_type: "open_id",
+  });
+  return data.code === 0 ? "成员添加成功" : `添加失败: ${data.msg}`;
+}
+
+async function updateGroupInfo(chatId, name, description) {
+  const body = {};
+  if (name) body.name = name;
+  if (description) body.description = description;
+  const data = await userApiCall(`/open-apis/im/v1/chats/${chatId}`, "PUT", body);
+  return data.code === 0 ? "群信息已更新" : `更新失败: ${data.msg}`;
+}
+
+// ── Calendar ─────────────────────────────────────────────────────────────────
+
+async function deleteCalendarEvent(eventId) {
+  const calId = await getPrimaryCalendarId();
+  const data = await userApiCall(`/open-apis/calendar/v4/calendars/${calId}/events/${eventId}`, "DELETE");
+  return data.code === 0 ? "日程已删除" : `删除失败: ${data.msg}`;
+}
+
+// ── Tasks ─────────────────────────────────────────────────────────────────────
+
+async function deleteTask(taskId) {
+  const data = await userApiCall(`/open-apis/task/v2/tasks/${taskId}`, "DELETE");
+  return data.code === 0 ? "任务已删除" : `删除失败: ${data.msg}`;
+}
+
+// ── Documents & Wiki ─────────────────────────────────────────────────────────
+
+async function appendDocContent(docToken, content) {
+  const data = await userApiCall(`/open-apis/docx/v1/documents/${docToken}/blocks/batch_update`, "PATCH", {
+    requests: [{
+      block_id: docToken,
+      update_block: {
+        block_type: 2,
+        text: { elements: [{ text_run: { content } }] },
+      },
+    }],
+  });
+  return data.code === 0 ? "内容已追加" : `追加失败: ${data.msg}`;
+}
+
+async function searchWiki(query) {
+  const data = await userApiCall(
+    `/open-apis/wiki/v1/nodes/search?query=${encodeURIComponent(query)}&page_size=10`
+  );
+  if (data.data?.items) {
+    return data.data.items.map((n) => ({ title: n.title, url: n.url, node_token: n.node_token }));
+  }
+  return data;
+}
+
+async function getWikiContent(spaceId, nodeToken) {
+  const data = await userApiCall(`/open-apis/wiki/v2/spaces/${spaceId}/nodes/${nodeToken}`);
+  if (data.data?.node) {
+    const node = data.data.node;
+    // Read actual doc content if it's a docx node
+    if (node.obj_type === "docx" && node.obj_token) {
+      return await getDocContent(node.obj_token);
+    }
+    return { title: node.title, type: node.obj_type, token: node.obj_token };
+  }
+  return data;
+}
+
+// ── Bitable (多维表格) ───────────────────────────────────────────────────────
+
+async function getBitableTables(appToken) {
+  const data = await userApiCall(`/open-apis/bitable/v1/apps/${appToken}/tables?page_size=20`);
+  if (data.data?.items) {
+    return data.data.items.map((t) => ({ name: t.name, table_id: t.table_id }));
+  }
+  return data;
+}
+
+async function getBitableRecords(appToken, tableId, pageSize = 20) {
+  const data = await userApiCall(
+    `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records?page_size=${pageSize}`
+  );
+  if (data.data?.items) {
+    return data.data.items.map((r) => ({ record_id: r.record_id, fields: r.fields }));
+  }
+  return data;
+}
+
+async function createBitableRecord(appToken, tableId, fields) {
+  const data = await userApiCall(
+    `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records`,
+    "POST",
+    { fields }
+  );
+  if (data.data?.record) return { success: true, record_id: data.data.record.record_id };
+  return data;
+}
+
+async function updateBitableRecord(appToken, tableId, recordId, fields) {
+  const data = await userApiCall(
+    `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records/${recordId}`,
+    "PUT",
+    { fields }
+  );
+  return data.code === 0 ? "记录更新成功" : `更新失败: ${data.msg}`;
+}
+
+async function deleteBitableRecord(appToken, tableId, recordId) {
+  const data = await userApiCall(
+    `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records/${recordId}`,
+    "DELETE"
+  );
+  return data.code === 0 ? "记录已删除" : `删除失败: ${data.msg}`;
+}
+
+// ── Spreadsheets ─────────────────────────────────────────────────────────────
+
+async function getSheetValues(spreadsheetToken, range) {
+  const data = await userApiCall(
+    `/open-apis/sheets/v2/spreadsheets/${spreadsheetToken}/values/${encodeURIComponent(range)}`
+  );
+  if (data.data?.valueRange) return data.data.valueRange;
+  return data;
+}
+
+async function updateSheetValues(spreadsheetToken, range, values) {
+  const data = await userApiCall(
+    `/open-apis/sheets/v2/spreadsheets/${spreadsheetToken}/values`,
+    "PUT",
+    { valueRange: { range, values } }
+  );
+  return data.code === 0 ? "表格已更新" : `更新失败: ${data.msg}`;
+}
+
+// ── Drive / Files ─────────────────────────────────────────────────────────────
+
+async function listFiles(folderToken) {
+  const url = folderToken
+    ? `/open-apis/drive/v1/files?folder_token=${folderToken}&page_size=20`
+    : `/open-apis/drive/v1/files?page_size=20`;
+  const data = await userApiCall(url);
+  if (data.data?.files) {
+    return data.data.files.map((f) => ({
+      name: f.name,
+      type: f.type,
+      token: f.token,
+      url: f.url,
+      created: new Date(Number(f.created_time) * 1000).toLocaleString("zh-CN"),
+    }));
+  }
+  return data;
+}
+
+async function moveFile(fileToken, folderToken) {
+  const data = await userApiCall(`/open-apis/drive/v1/files/${fileToken}/move`, "POST", {
+    type: "file",
+    folder_token: folderToken,
+  });
+  return data.code === 0 ? "文件已移动" : `移动失败: ${data.msg}`;
+}
+
+// ── Contacts ──────────────────────────────────────────────────────────────────
+
+async function getUserDetail(openId) {
+  const data = await userApiCall(`/open-apis/contact/v3/users/${openId}?user_id_type=open_id`);
+  if (data.data?.user) {
+    const u = data.data.user;
+    return { name: u.name, email: u.email, mobile: u.mobile, open_id: u.open_id, job_title: u.job_title, department_ids: u.department_ids };
+  }
+  return data;
+}
+
+async function getDepartments(parentDepartmentId) {
+  const url = parentDepartmentId
+    ? `/open-apis/contact/v3/departments?parent_department_id=${parentDepartmentId}&page_size=20`
+    : `/open-apis/contact/v3/departments?fetch_child=true&page_size=20`;
+  const data = await userApiCall(url);
+  if (data.data?.items) {
+    return data.data.items.map((d) => ({ name: d.name, department_id: d.department_id, leader_user_id: d.leader_user_id }));
+  }
+  return data;
+}
+
+// ── Approval ──────────────────────────────────────────────────────────────────
+
+async function getApprovalInstances(approvalCode, pageSize = 20) {
+  const data = await userApiCall(
+    `/open-apis/approval/v4/instances?approval_code=${approvalCode}&page_size=${pageSize}`
+  );
+  if (data.data?.instance_code_list) return data.data.instance_code_list;
+  return data;
+}
+
+async function getApprovalInstanceDetail(instanceCode) {
+  const data = await userApiCall(`/open-apis/approval/v4/instances/${instanceCode}`);
+  if (data.data) {
+    const d = data.data;
+    return { status: d.status, start_time: new Date(Number(d.start_time)).toLocaleString("zh-CN"), form: d.form, task_list: d.task_list };
+  }
+  return data;
+}
+
 // Tool definitions for Claude
 const tools = [
   {
@@ -511,6 +759,297 @@ const tools = [
     },
   },
   {
+    name: "delete_message",
+    description: "删除飞书中的一条消息。",
+    input_schema: {
+      type: "object",
+      properties: { message_id: { type: "string", description: "消息 ID" } },
+      required: ["message_id"],
+    },
+  },
+  {
+    name: "get_chat_members",
+    description: "获取飞书群聊的成员列表。",
+    input_schema: {
+      type: "object",
+      properties: { chat_id: { type: "string", description: "群聊 ID" } },
+      required: ["chat_id"],
+    },
+  },
+  {
+    name: "pin_message",
+    description: "置顶飞书群聊中的一条消息。",
+    input_schema: {
+      type: "object",
+      properties: {
+        chat_id: { type: "string", description: "群聊 ID" },
+        message_id: { type: "string", description: "消息 ID" },
+      },
+      required: ["chat_id", "message_id"],
+    },
+  },
+  {
+    name: "add_reaction",
+    description: "对飞书消息添加 emoji 表情回应。",
+    input_schema: {
+      type: "object",
+      properties: {
+        message_id: { type: "string", description: "消息 ID" },
+        reaction_type: { type: "string", description: "emoji 类型，如 THUMBSUP、OK、SMILE 等" },
+      },
+      required: ["message_id", "reaction_type"],
+    },
+  },
+  {
+    name: "forward_message",
+    description: "将一条消息转发到指定群聊。",
+    input_schema: {
+      type: "object",
+      properties: {
+        message_id: { type: "string", description: "要转发的消息 ID" },
+        chat_id: { type: "string", description: "目标群聊 ID" },
+      },
+      required: ["message_id", "chat_id"],
+    },
+  },
+  {
+    name: "create_group",
+    description: "创建一个新的飞书群聊。",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "群名称" },
+        open_ids: { type: "array", items: { type: "string" }, description: "初始成员的 open_id 列表" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "add_group_member",
+    description: "向飞书群聊添加成员。",
+    input_schema: {
+      type: "object",
+      properties: {
+        chat_id: { type: "string", description: "群聊 ID" },
+        open_ids: { type: "array", items: { type: "string" }, description: "要添加的成员 open_id 列表" },
+      },
+      required: ["chat_id", "open_ids"],
+    },
+  },
+  {
+    name: "update_group_info",
+    description: "修改飞书群聊的名称或描述。",
+    input_schema: {
+      type: "object",
+      properties: {
+        chat_id: { type: "string", description: "群聊 ID" },
+        name: { type: "string", description: "新群名（可选）" },
+        description: { type: "string", description: "新描述（可选）" },
+      },
+      required: ["chat_id"],
+    },
+  },
+  {
+    name: "delete_calendar_event",
+    description: "删除飞书日历中的日程。",
+    input_schema: {
+      type: "object",
+      properties: { event_id: { type: "string", description: "日程 ID" } },
+      required: ["event_id"],
+    },
+  },
+  {
+    name: "delete_task",
+    description: "删除飞书中的任务。",
+    input_schema: {
+      type: "object",
+      properties: { task_id: { type: "string", description: "任务 ID" } },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "append_doc_content",
+    description: "向飞书文档末尾追加文字内容。",
+    input_schema: {
+      type: "object",
+      properties: {
+        doc_token: { type: "string", description: "文档 token" },
+        content: { type: "string", description: "要追加的文字内容" },
+      },
+      required: ["doc_token", "content"],
+    },
+  },
+  {
+    name: "search_wiki",
+    description: "在飞书知识库中搜索页面。",
+    input_schema: {
+      type: "object",
+      properties: { query: { type: "string", description: "搜索关键词" } },
+      required: ["query"],
+    },
+  },
+  {
+    name: "get_wiki_content",
+    description: "读取飞书知识库页面内容。",
+    input_schema: {
+      type: "object",
+      properties: {
+        space_id: { type: "string", description: "知识库 space ID" },
+        node_token: { type: "string", description: "节点 token" },
+      },
+      required: ["space_id", "node_token"],
+    },
+  },
+  {
+    name: "get_bitable_tables",
+    description: "获取飞书多维表格（Bitable）中的所有数据表列表。",
+    input_schema: {
+      type: "object",
+      properties: { app_token: { type: "string", description: "多维表格 app token（URL 中的 base/xxxxx 部分）" } },
+      required: ["app_token"],
+    },
+  },
+  {
+    name: "get_bitable_records",
+    description: "读取飞书多维表格中的记录。",
+    input_schema: {
+      type: "object",
+      properties: {
+        app_token: { type: "string", description: "多维表格 app token" },
+        table_id: { type: "string", description: "数据表 ID（从 get_bitable_tables 获取）" },
+        page_size: { type: "number", description: "获取条数，默认 20" },
+      },
+      required: ["app_token", "table_id"],
+    },
+  },
+  {
+    name: "create_bitable_record",
+    description: "在飞书多维表格中创建新记录。",
+    input_schema: {
+      type: "object",
+      properties: {
+        app_token: { type: "string", description: "多维表格 app token" },
+        table_id: { type: "string", description: "数据表 ID" },
+        fields: { type: "object", description: "字段键值对，如 {\"姓名\": \"张三\", \"状态\": \"进行中\"}" },
+      },
+      required: ["app_token", "table_id", "fields"],
+    },
+  },
+  {
+    name: "update_bitable_record",
+    description: "更新飞书多维表格中的记录。",
+    input_schema: {
+      type: "object",
+      properties: {
+        app_token: { type: "string", description: "多维表格 app token" },
+        table_id: { type: "string", description: "数据表 ID" },
+        record_id: { type: "string", description: "记录 ID" },
+        fields: { type: "object", description: "要更新的字段键值对" },
+      },
+      required: ["app_token", "table_id", "record_id", "fields"],
+    },
+  },
+  {
+    name: "delete_bitable_record",
+    description: "删除飞书多维表格中的记录。",
+    input_schema: {
+      type: "object",
+      properties: {
+        app_token: { type: "string", description: "多维表格 app token" },
+        table_id: { type: "string", description: "数据表 ID" },
+        record_id: { type: "string", description: "记录 ID" },
+      },
+      required: ["app_token", "table_id", "record_id"],
+    },
+  },
+  {
+    name: "get_sheet_values",
+    description: "读取飞书电子表格中指定范围的数据。",
+    input_schema: {
+      type: "object",
+      properties: {
+        spreadsheet_token: { type: "string", description: "表格 token（URL 中的 sheets/xxxxx 部分）" },
+        range: { type: "string", description: "单元格范围，如 Sheet1!A1:C10" },
+      },
+      required: ["spreadsheet_token", "range"],
+    },
+  },
+  {
+    name: "update_sheet_values",
+    description: "向飞书电子表格写入数据。",
+    input_schema: {
+      type: "object",
+      properties: {
+        spreadsheet_token: { type: "string", description: "表格 token" },
+        range: { type: "string", description: "写入范围，如 Sheet1!A1" },
+        values: { type: "array", description: "二维数组，如 [[\"A\",\"B\"],[1,2]]" },
+      },
+      required: ["spreadsheet_token", "range", "values"],
+    },
+  },
+  {
+    name: "list_files",
+    description: "列出飞书云空间中的文件和文件夹。",
+    input_schema: {
+      type: "object",
+      properties: {
+        folder_token: { type: "string", description: "文件夹 token（不填则列出根目录）" },
+      },
+    },
+  },
+  {
+    name: "move_file",
+    description: "将飞书云空间中的文件移动到指定文件夹。",
+    input_schema: {
+      type: "object",
+      properties: {
+        file_token: { type: "string", description: "文件 token" },
+        folder_token: { type: "string", description: "目标文件夹 token" },
+      },
+      required: ["file_token", "folder_token"],
+    },
+  },
+  {
+    name: "get_user_detail",
+    description: "根据 open_id 获取飞书用户的详细信息，包括手机、邮箱、职位、部门等。",
+    input_schema: {
+      type: "object",
+      properties: { open_id: { type: "string", description: "用户 open_id" } },
+      required: ["open_id"],
+    },
+  },
+  {
+    name: "get_departments",
+    description: "获取飞书组织架构中的部门列表。",
+    input_schema: {
+      type: "object",
+      properties: {
+        parent_department_id: { type: "string", description: "父部门 ID（不填则获取顶层部门）" },
+      },
+    },
+  },
+  {
+    name: "get_approval_instances",
+    description: "获取指定审批类型的审批实例列表。",
+    input_schema: {
+      type: "object",
+      properties: {
+        approval_code: { type: "string", description: "审批定义 code" },
+        page_size: { type: "number", description: "获取条数，默认 20" },
+      },
+      required: ["approval_code"],
+    },
+  },
+  {
+    name: "get_approval_instance_detail",
+    description: "获取某个审批实例的详细信息，包括状态、表单内容、审批流程。",
+    input_schema: {
+      type: "object",
+      properties: { instance_code: { type: "string", description: "审批实例 code" } },
+      required: ["instance_code"],
+    },
+  },
+  {
     name: "get_private_messages",
     description: "读取与某个用户的私聊消息记录，用姓名或关键词匹配。",
     input_schema: {
@@ -584,6 +1123,58 @@ async function executeTool(name, input) {
       return JSON.stringify(await searchMessages(input.query, input.page_size));
     case "get_department_members":
       return JSON.stringify(await getDepartmentMembers(input.department_id));
+    case "delete_message":
+      return await deleteMessage(input.message_id);
+    case "get_chat_members":
+      return JSON.stringify(await getChatMembers(input.chat_id));
+    case "pin_message":
+      return await pinMessage(input.chat_id, input.message_id);
+    case "add_reaction":
+      return await addReaction(input.message_id, input.reaction_type);
+    case "forward_message":
+      return await forwardMessage(input.message_id, input.chat_id);
+    case "create_group":
+      return JSON.stringify(await createGroup(input.name, input.open_ids || []));
+    case "add_group_member":
+      return await addGroupMember(input.chat_id, input.open_ids);
+    case "update_group_info":
+      return await updateGroupInfo(input.chat_id, input.name, input.description);
+    case "delete_calendar_event":
+      return await deleteCalendarEvent(input.event_id);
+    case "delete_task":
+      return await deleteTask(input.task_id);
+    case "append_doc_content":
+      return await appendDocContent(input.doc_token, input.content);
+    case "search_wiki":
+      return JSON.stringify(await searchWiki(input.query));
+    case "get_wiki_content":
+      return JSON.stringify(await getWikiContent(input.space_id, input.node_token));
+    case "get_bitable_tables":
+      return JSON.stringify(await getBitableTables(input.app_token));
+    case "get_bitable_records":
+      return JSON.stringify(await getBitableRecords(input.app_token, input.table_id, input.page_size));
+    case "create_bitable_record":
+      return JSON.stringify(await createBitableRecord(input.app_token, input.table_id, input.fields));
+    case "update_bitable_record":
+      return await updateBitableRecord(input.app_token, input.table_id, input.record_id, input.fields);
+    case "delete_bitable_record":
+      return await deleteBitableRecord(input.app_token, input.table_id, input.record_id);
+    case "get_sheet_values":
+      return JSON.stringify(await getSheetValues(input.spreadsheet_token, input.range));
+    case "update_sheet_values":
+      return await updateSheetValues(input.spreadsheet_token, input.range, input.values);
+    case "list_files":
+      return JSON.stringify(await listFiles(input.folder_token));
+    case "move_file":
+      return await moveFile(input.file_token, input.folder_token);
+    case "get_user_detail":
+      return JSON.stringify(await getUserDetail(input.open_id));
+    case "get_departments":
+      return JSON.stringify(await getDepartments(input.parent_department_id));
+    case "get_approval_instances":
+      return JSON.stringify(await getApprovalInstances(input.approval_code, input.page_size));
+    case "get_approval_instance_detail":
+      return JSON.stringify(await getApprovalInstanceDetail(input.instance_code));
     default:
       return `未知工具: ${name}`;
   }
