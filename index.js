@@ -377,13 +377,15 @@ app.post("/webhook", async (req, res) => {
 app.get("/", (req, res) => res.send("Lark Claude Bot is running."));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`✅ 服务启动：http://localhost:${PORT}`);
-  if (userAccessToken) {
-    console.log("✅ 用户 token 已加载");
-    // Set expiry from env or default to needing refresh soon
+  if (userRefreshToken) {
+    // Proactively refresh on startup so access token is always fresh
+    await refreshUserToken();
+  } else if (userAccessToken) {
+    console.log("✅ 用户 access token 已加载（无 refresh token，不会自动续期）");
     tokenExpiresAt = Date.now() + 3600 * 1000;
   } else {
-    console.log("⚠️  未配置 LARK_USER_ACCESS_TOKEN，用户级功能不可用");
+    console.log("⚠️  未配置用户 token，用户级功能不可用");
   }
 });
