@@ -19,6 +19,9 @@ const larkClient = new lark.Client({
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
   baseURL: process.env.ANTHROPIC_BASE_URL,
+  defaultHeaders: {
+    "Authorization": `Bearer ${process.env.ANTHROPIC_API_KEY}`,
+  },
 });
 
 // 多轮对话历史
