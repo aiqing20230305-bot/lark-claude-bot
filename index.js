@@ -302,6 +302,39 @@ async function createDoc(title, folderToken) {
   return data;
 }
 
+async function getPrivateMessages(nameOrOpenId, pageSize = 20) {
+  // List all p2p chats
+  const data = await userApiCall("/open-apis/im/v1/chats?chat_type=p2p&page_size=50");
+  if (!data.data?.items) return data;
+
+  // Find the matching chat by name
+  const chat = data.data.items.find(
+    (c) => c.name?.includes(nameOrOpenId) || c.chat_id?.includes(nameOrOpenId)
+  );
+  if (!chat) return `未找到与「${nameOrOpenId}」的私聊，可用 get_chats 查看所有会话`;
+
+  return await getMessages(chat.chat_id, pageSize);
+}
+
+async function searchMessages(query, pageSize = 20) {
+  const data = await userApiCall(
+    `/open-apis/im/v1/messages/search?query=${encodeURIComponent(query)}&page_size=${pageSize}`
+  );
+  if (data.data?.items) {
+    return data.data.items.map((m) => {
+      let content = m.body?.content || "";
+      try { content = JSON.parse(content).text || content; } catch {}
+      return {
+        chat_id: m.chat_id,
+        sender: m.sender?.id,
+        time: new Date(Number(m.create_time)).toLocaleString("zh-CN"),
+        content: content.slice(0, 300),
+      };
+    });
+  }
+  return data;
+}
+
 async function getDepartmentMembers(departmentId) {
   const data = await userApiCall(
     `/open-apis/contact/v3/users?department_id=${departmentId}&page_size=20&user_id_type=open_id`
@@ -478,6 +511,30 @@ const tools = [
     },
   },
   {
+    name: "get_private_messages",
+    description: "读取与某个用户的私聊消息记录，用姓名或关键词匹配。",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "对方的姓名或部分名称" },
+        page_size: { type: "number", description: "获取条数，默认 20" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "search_messages",
+    description: "在飞书中全局搜索包含关键词的消息。",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "搜索关键词" },
+        page_size: { type: "number", description: "结果数量，默认 20" },
+      },
+      required: ["query"],
+    },
+  },
+  {
     name: "get_department_members",
     description: "获取指定部门的成员列表。",
     input_schema: {
@@ -521,6 +578,10 @@ async function executeTool(name, input) {
       return await getDocContent(input.doc_token);
     case "create_doc":
       return JSON.stringify(await createDoc(input.title, input.folder_token));
+    case "get_private_messages":
+      return JSON.stringify(await getPrivateMessages(input.name, input.page_size));
+    case "search_messages":
+      return JSON.stringify(await searchMessages(input.query, input.page_size));
     case "get_department_members":
       return JSON.stringify(await getDepartmentMembers(input.department_id));
     default:
