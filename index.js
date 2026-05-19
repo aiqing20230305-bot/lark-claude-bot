@@ -111,6 +111,26 @@ async function userApiCall(path, method = "GET", body = null) {
   }
 }
 
+// lark-proxy call (local Mac tunnel)
+async function larkProxyExec(args) {
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (!proxyUrl) return { error: "未配置 LARK_PROXY_URL，请先启动本地代理并设置环境变量" };
+
+  try {
+    const res = await fetch(`${proxyUrl}/exec`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026",
+      },
+      body: JSON.stringify({ args }),
+    });
+    return await res.json();
+  } catch (err) {
+    return { error: `代理连接失败: ${err.message}` };
+  }
+}
+
 // Tool implementations
 async function getCalendarEvents(startTime, endTime) {
   // Get primary calendar ID first
@@ -601,6 +621,27 @@ async function getApprovalInstanceDetail(instanceCode) {
 // Tool definitions for Claude
 const tools = [
   {
+    name: "run_lark_cli",
+    description: `通过本地 lark-cli 执行任意飞书操作，权限最完整、token 自动管理。
+用法示例：
+- 读聊天记录: args=["api","GET","/open-apis/im/v1/messages","--params","{\"container_id_type\":\"chat\",\"container_id\":\"oc_xxx\"}"]
+- 搜索用户: args=["contact","+search-user","--query","张三"]
+- 查日历: args=["calendar","+agenda"]
+- 任意API: args=["api","POST","/open-apis/xxx","--data","{...}"]
+优先使用此工具，仅在代理不可用时降级到其他工具。`,
+    input_schema: {
+      type: "object",
+      properties: {
+        args: {
+          type: "array",
+          items: { type: "string" },
+          description: "lark-cli 命令参数列表，不含 'lark-cli' 本身，如 [\"api\",\"GET\",\"/open-apis/im/v1/chats\"]",
+        },
+      },
+      required: ["args"],
+    },
+  },
+  {
     name: "get_calendar_events",
     description: "获取用户的日历事件/日程安排。可以查看今天、本周或指定时间范围的会议和日程。",
     input_schema: {
@@ -1089,6 +1130,8 @@ const tools = [
 // Execute a tool call
 async function executeTool(name, input) {
   switch (name) {
+    case "run_lark_cli":
+      return JSON.stringify(await larkProxyExec(input.args));
     case "get_calendar_events":
       return JSON.stringify(await getCalendarEvents(input.start_timestamp, input.end_timestamp));
     case "get_tasks":
