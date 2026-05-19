@@ -203,6 +203,120 @@ async function sendMessage(chatId, text) {
   return data.code === 0 ? "消息发送成功" : `发送失败: ${data.msg}`;
 }
 
+async function getMessages(chatId, pageSize = 20) {
+  const data = await userApiCall(
+    `/open-apis/im/v1/messages?container_id_type=chat&container_id=${chatId}&page_size=${pageSize}&sort_type=ByCreateTimeDesc`
+  );
+  if (data.data?.items) {
+    return data.data.items.map((m) => {
+      let content = m.body?.content || "";
+      try { content = JSON.parse(content).text || content; } catch {}
+      return {
+        sender: m.sender?.id,
+        time: new Date(Number(m.create_time)).toLocaleString("zh-CN"),
+        content: content.slice(0, 300),
+        type: m.msg_type,
+      };
+    });
+  }
+  return data;
+}
+
+async function sendDirectMessage(openId, text) {
+  const data = await userApiCall("/open-apis/im/v1/messages?receive_id_type=open_id", "POST", {
+    receive_id: openId,
+    msg_type: "text",
+    content: JSON.stringify({ text }),
+  });
+  return data.code === 0 ? "消息发送成功" : `发送失败: ${data.msg}`;
+}
+
+async function getPrimaryCalendarId() {
+  const cals = await userApiCall("/open-apis/calendar/v4/calendars?page_size=10");
+  if (cals.data?.calendar_list) {
+    const primary = cals.data.calendar_list.find((c) => c.role === "owner" && c.type === "primary");
+    if (primary) return primary.calendar_id;
+  }
+  return "primary";
+}
+
+async function createCalendarEvent(summary, startTimestamp, endTimestamp, description, location) {
+  const calId = await getPrimaryCalendarId();
+  const body = {
+    summary,
+    start_time: { timestamp: startTimestamp },
+    end_time: { timestamp: endTimestamp },
+  };
+  if (description) body.description = description;
+  if (location) body.location = { name: location };
+  const data = await userApiCall(`/open-apis/calendar/v4/calendars/${calId}/events`, "POST", body);
+  if (data.data?.event) {
+    return { success: true, event_id: data.data.event.event_id, summary: data.data.event.summary };
+  }
+  return data;
+}
+
+async function updateCalendarEvent(eventId, summary, startTimestamp, endTimestamp, description) {
+  const calId = await getPrimaryCalendarId();
+  const body = {};
+  if (summary) body.summary = summary;
+  if (startTimestamp) body.start_time = { timestamp: startTimestamp };
+  if (endTimestamp) body.end_time = { timestamp: endTimestamp };
+  if (description) body.description = description;
+  const data = await userApiCall(`/open-apis/calendar/v4/calendars/${calId}/events/${eventId}`, "PATCH", body);
+  return data.code === 0 ? "日程更新成功" : `更新失败: ${data.msg}（${JSON.stringify(data).slice(0, 100)}）`;
+}
+
+async function createTask(title, dueTimestamp, description) {
+  const body = { summary: title };
+  if (dueTimestamp) body.due = { timestamp: dueTimestamp };
+  if (description) body.description = { mode: 1, text: description };
+  const data = await userApiCall("/open-apis/task/v2/tasks", "POST", body);
+  if (data.data?.task) {
+    return { success: true, task_id: data.data.task.guid, title: data.data.task.summary };
+  }
+  return data;
+}
+
+async function updateTask(taskId, completed, title) {
+  const body = {};
+  if (title) body.summary = title;
+  if (completed) body.completed_at = Date.now().toString();
+  const data = await userApiCall(`/open-apis/task/v2/tasks/${taskId}`, "PATCH", body);
+  return data.code === 0 ? "任务更新成功" : `更新失败: ${data.msg}`;
+}
+
+async function getDocContent(docToken) {
+  const data = await userApiCall(`/open-apis/docx/v1/documents/${docToken}/raw_content`);
+  if (data.data?.content) return data.data.content.slice(0, 4000);
+  return JSON.stringify(data);
+}
+
+async function createDoc(title, folderToken) {
+  const body = { title };
+  if (folderToken) body.folder_token = folderToken;
+  const data = await userApiCall("/open-apis/docx/v1/documents", "POST", body);
+  if (data.data?.document) {
+    return { success: true, doc_token: data.data.document.document_id, url: data.data.document.url };
+  }
+  return data;
+}
+
+async function getDepartmentMembers(departmentId) {
+  const data = await userApiCall(
+    `/open-apis/contact/v3/users?department_id=${departmentId}&page_size=20&user_id_type=open_id`
+  );
+  if (data.data?.items) {
+    return data.data.items.map((u) => ({
+      name: u.name,
+      email: u.email,
+      open_id: u.open_id,
+      title: u.job_title,
+    }));
+  }
+  return data;
+}
+
 // Tool definitions for Claude
 const tools = [
   {
@@ -260,6 +374,120 @@ const tools = [
       required: ["chat_id", "text"],
     },
   },
+  {
+    name: "get_messages",
+    description: "获取指定飞书群聊的历史消息记录。",
+    input_schema: {
+      type: "object",
+      properties: {
+        chat_id: { type: "string", description: "群聊 ID（从 get_chats 获取）" },
+        page_size: { type: "number", description: "获取条数，默认 20" },
+      },
+      required: ["chat_id"],
+    },
+  },
+  {
+    name: "send_direct_message",
+    description: "给飞书用户发送私信（需要 open_id，可从 search_users 获取）。",
+    input_schema: {
+      type: "object",
+      properties: {
+        open_id: { type: "string", description: "用户 open_id" },
+        text: { type: "string", description: "消息内容" },
+      },
+      required: ["open_id", "text"],
+    },
+  },
+  {
+    name: "create_calendar_event",
+    description: "在飞书日历中创建新的日程/会议。",
+    input_schema: {
+      type: "object",
+      properties: {
+        summary: { type: "string", description: "日程标题" },
+        start_timestamp: { type: "string", description: "开始时间 Unix 时间戳（秒）" },
+        end_timestamp: { type: "string", description: "结束时间 Unix 时间戳（秒）" },
+        description: { type: "string", description: "日程描述（可选）" },
+        location: { type: "string", description: "地点（可选）" },
+      },
+      required: ["summary", "start_timestamp", "end_timestamp"],
+    },
+  },
+  {
+    name: "update_calendar_event",
+    description: "修改飞书日历中已有的日程。",
+    input_schema: {
+      type: "object",
+      properties: {
+        event_id: { type: "string", description: "日程 ID" },
+        summary: { type: "string", description: "新标题（可选）" },
+        start_timestamp: { type: "string", description: "新开始时间（可选）" },
+        end_timestamp: { type: "string", description: "新结束时间（可选）" },
+        description: { type: "string", description: "新描述（可选）" },
+      },
+      required: ["event_id"],
+    },
+  },
+  {
+    name: "create_task",
+    description: "在飞书任务中创建新的待办任务。",
+    input_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "任务标题" },
+        due_timestamp: { type: "string", description: "截止时间 Unix 时间戳（毫秒，可选）" },
+        description: { type: "string", description: "任务描述（可选）" },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    name: "update_task",
+    description: "更新飞书任务状态（完成/修改标题）。",
+    input_schema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "任务 ID（从 get_tasks 获取）" },
+        completed: { type: "boolean", description: "是否标记为完成" },
+        title: { type: "string", description: "新标题（可选）" },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "get_doc_content",
+    description: "读取飞书云文档的文本内容。",
+    input_schema: {
+      type: "object",
+      properties: {
+        doc_token: { type: "string", description: "文档 token（URL 中的 docx/xxxxx 部分）" },
+      },
+      required: ["doc_token"],
+    },
+  },
+  {
+    name: "create_doc",
+    description: "在飞书云空间创建新文档。",
+    input_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "文档标题" },
+        folder_token: { type: "string", description: "存放的文件夹 token（可选，不填放根目录）" },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    name: "get_department_members",
+    description: "获取指定部门的成员列表。",
+    input_schema: {
+      type: "object",
+      properties: {
+        department_id: { type: "string", description: "部门 ID" },
+      },
+      required: ["department_id"],
+    },
+  },
 ];
 
 // Execute a tool call
@@ -277,6 +505,24 @@ async function executeTool(name, input) {
       return JSON.stringify(await getChats());
     case "send_message":
       return await sendMessage(input.chat_id, input.text);
+    case "get_messages":
+      return JSON.stringify(await getMessages(input.chat_id, input.page_size));
+    case "send_direct_message":
+      return await sendDirectMessage(input.open_id, input.text);
+    case "create_calendar_event":
+      return JSON.stringify(await createCalendarEvent(input.summary, input.start_timestamp, input.end_timestamp, input.description, input.location));
+    case "update_calendar_event":
+      return await updateCalendarEvent(input.event_id, input.summary, input.start_timestamp, input.end_timestamp, input.description);
+    case "create_task":
+      return JSON.stringify(await createTask(input.title, input.due_timestamp, input.description));
+    case "update_task":
+      return await updateTask(input.task_id, input.completed, input.title);
+    case "get_doc_content":
+      return await getDocContent(input.doc_token);
+    case "create_doc":
+      return JSON.stringify(await createDoc(input.title, input.folder_token));
+    case "get_department_members":
+      return JSON.stringify(await getDepartmentMembers(input.department_id));
     default:
       return `未知工具: ${name}`;
   }
