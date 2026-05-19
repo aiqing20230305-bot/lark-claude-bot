@@ -44,34 +44,39 @@ async function refreshUserToken() {
     return;
   }
 
-  // Step 2: refresh user token using app_access_token as Bearer
-  const res = await fetch("https://open.feishu.cn/open-apis/authen/v2/oidc/refresh_access_token", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${aat}`,
+  // Step 2: try v1 endpoint first, then v2
+  const endpoints = [
+    {
+      url: "https://open.feishu.cn/open-apis/authen/v1/refresh_access_token",
+      body: { app_access_token: aat, grant_type: "refresh_token", refresh_token: userRefreshToken },
+      headers: { "Content-Type": "application/json" },
     },
-    body: JSON.stringify({
-      grant_type: "refresh_token",
-      refresh_token: userRefreshToken,
-    }),
-  });
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    console.error("[Token] 刷新接口返回非 JSON:", text.slice(0, 200));
-    return;
-  }
-  const token = data.data || data;
-  if (token.access_token) {
-    userAccessToken = token.access_token;
-    if (token.refresh_token) userRefreshToken = token.refresh_token;
-    tokenExpiresAt = Date.now() + (token.expires_in || 7200) * 1000 - 60000;
-    console.log("[Token] 刷新成功，有效期至:", new Date(tokenExpiresAt).toLocaleString("zh-CN"));
-  } else {
-    console.error("[Token] 刷新失败:", text.slice(0, 300));
+    {
+      url: "https://open.feishu.cn/open-apis/authen/v2/oidc/refresh_access_token",
+      body: { grant_type: "refresh_token", refresh_token: userRefreshToken },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${aat}` },
+    },
+  ];
+
+  for (const ep of endpoints) {
+    const res = await fetch(ep.url, { method: "POST", headers: ep.headers, body: JSON.stringify(ep.body) });
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      console.error(`[Token] ${ep.url} 返回非 JSON:`, text.slice(0, 100));
+      continue;
+    }
+    const token = data.data || data;
+    if (token.access_token) {
+      userAccessToken = token.access_token;
+      if (token.refresh_token) userRefreshToken = token.refresh_token;
+      tokenExpiresAt = Date.now() + (token.expires_in || 7200) * 1000 - 60000;
+      console.log("[Token] 刷新成功，有效期至:", new Date(tokenExpiresAt).toLocaleString("zh-CN"));
+      return;
+    }
+    console.error(`[Token] ${ep.url} 刷新失败:`, text.slice(0, 200));
   }
 }
 
@@ -415,11 +420,14 @@ app.listen(PORT, () => {
   // Async startup without blocking the server
   (async () => {
     try {
-      if (userRefreshToken) {
-        await refreshUserToken();
-      } else if (userAccessToken) {
-        console.log("✅ 用户 access token 已加载（无 refresh token，不会自动续期）");
+      if (userAccessToken) {
         tokenExpiresAt = Date.now() + 3600 * 1000;
+        console.log("✅ 用户 access token 已加载");
+        if (userRefreshToken) {
+          await refreshUserToken();
+        }
+      } else if (userRefreshToken) {
+        await refreshUserToken();
       } else {
         console.log("⚠️  未配置用户 token，用户级功能不可用");
       }
