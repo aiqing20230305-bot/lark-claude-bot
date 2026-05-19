@@ -402,16 +402,29 @@ app.post("/webhook", async (req, res) => {
 
 app.get("/", (req, res) => res.send("Lark Claude Bot is running."));
 
+process.on("unhandledRejection", (reason) => {
+  console.error("[UnhandledRejection]", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[UncaughtException]", err.message);
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log(`✅ 服务启动：http://localhost:${PORT}`);
-  if (userRefreshToken) {
-    // Proactively refresh on startup so access token is always fresh
-    await refreshUserToken();
-  } else if (userAccessToken) {
-    console.log("✅ 用户 access token 已加载（无 refresh token，不会自动续期）");
-    tokenExpiresAt = Date.now() + 3600 * 1000;
-  } else {
-    console.log("⚠️  未配置用户 token，用户级功能不可用");
-  }
+  // Async startup without blocking the server
+  (async () => {
+    try {
+      if (userRefreshToken) {
+        await refreshUserToken();
+      } else if (userAccessToken) {
+        console.log("✅ 用户 access token 已加载（无 refresh token，不会自动续期）");
+        tokenExpiresAt = Date.now() + 3600 * 1000;
+      } else {
+        console.log("⚠️  未配置用户 token，用户级功能不可用");
+      }
+    } catch (err) {
+      console.error("[启动 Token 刷新失败]", err.message);
+    }
+  })();
 });
