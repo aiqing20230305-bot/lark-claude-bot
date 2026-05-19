@@ -111,6 +111,25 @@ async function userApiCall(path, method = "GET", body = null) {
   }
 }
 
+// dreamina proxy call
+async function dreaminaExec(args) {
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (!proxyUrl) return { error: "未配置 LARK_PROXY_URL" };
+  try {
+    const res = await fetch(`${proxyUrl}/dreamina`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026",
+      },
+      body: JSON.stringify({ args }),
+    });
+    return await res.json();
+  } catch (err) {
+    return { error: `代理连接失败: ${err.message}` };
+  }
+}
+
 // lark-proxy call (local Mac tunnel)
 async function larkProxyExec(args) {
   const proxyUrl = process.env.LARK_PROXY_URL;
@@ -621,6 +640,29 @@ async function getApprovalInstanceDetail(instanceCode) {
 // Tool definitions for Claude
 const tools = [
   {
+    name: "run_dreamina",
+    description: `调用本地即梦(Dreamina) CLI 生成图片或视频，以及查询任务状态。
+支持的命令：
+- 文生图: args=["text2image","--prompt","一只猫","--ratio","1:1","--resolution_type","2k"]
+- 文生视频: args=["text2video","--prompt","海浪翻滚"]
+- 图生视频: args=["image2video","--image_url","https://...","--prompt","描述"]
+- 查询任务: args=["query_result","--submit_id","任务ID"]
+- 任务列表: args=["list_task","--gen_status","success"]
+- 账户余额: args=["user_credit"]
+注意：生成任务是异步的，先提交得到 submit_id，再用 query_result 查询结果。`,
+    input_schema: {
+      type: "object",
+      properties: {
+        args: {
+          type: "array",
+          items: { type: "string" },
+          description: "dreamina 命令参数，不含 'dreamina' 本身",
+        },
+      },
+      required: ["args"],
+    },
+  },
+  {
     name: "run_lark_cli",
     description: `通过本地 lark-cli 执行任意飞书操作，权限最完整、token 自动管理。
 用法示例：
@@ -1130,6 +1172,8 @@ const tools = [
 // Execute a tool call
 async function executeTool(name, input) {
   switch (name) {
+    case "run_dreamina":
+      return JSON.stringify(await dreaminaExec(input.args));
     case "run_lark_cli":
       return JSON.stringify(await larkProxyExec(input.args));
     case "get_calendar_events":
