@@ -111,6 +111,120 @@ async function userApiCall(path, method = "GET", body = null) {
   }
 }
 
+// ── App access token (for downloading resources & ASR) ───────────────────────
+let _appToken = "";
+let _appTokenExpiry = 0;
+
+async function getAppToken() {
+  if (_appToken && Date.now() < _appTokenExpiry) return _appToken;
+  const res = await fetch("https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ app_id: process.env.LARK_APP_ID, app_secret: process.env.LARK_APP_SECRET }),
+  });
+  const data = await res.json();
+  _appToken = data.app_access_token;
+  _appTokenExpiry = Date.now() + ((data.expire || 7200) - 60) * 1000;
+  return _appToken;
+}
+
+// Download a message resource (image / file) as Buffer
+async function downloadResource(messageId, fileKey, type) {
+  const token = await getAppToken();
+  const res = await fetch(
+    `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=${type}`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+// Feishu file speech-to-text (ogg_opus / pcm / wav)
+async function feishuASR(audioBuffer, format = "ogg_opus") {
+  const token = await getAppToken();
+  const res = await fetch("https://open.feishu.cn/open-apis/speech_to_text/v1/speech/file_recognize", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      speech: { speech: audioBuffer.toString("base64") },
+      config: { file_id: `asr_${Date.now()}`, format, engine_type: "16k_0" },
+    }),
+  });
+  const data = await res.json();
+  if (data.code !== 0) throw new Error(`ASR error ${data.code}: ${data.msg}`);
+  return data.data?.recognition_text || "";
+}
+
+// Build Claude content blocks for image message
+async function processImageMessage(message) {
+  const { image_key } = JSON.parse(message.content);
+  const buf = await downloadResource(message.message_id, image_key, "image");
+  return [
+    { type: "text", text: "用户发送了一张图片：" },
+    { type: "image", source: { type: "base64", media_type: "image/jpeg", data: buf.toString("base64") } },
+  ];
+}
+
+// Build text content for audio message
+async function processAudioMessage(message) {
+  const { file_key, duration } = JSON.parse(message.content);
+  const buf = await downloadResource(message.message_id, file_key, "file");
+  const sec = Math.round((duration || 0) / 1000);
+  try {
+    const transcript = await feishuASR(buf, "ogg_opus");
+    return `[语音消息，时长 ${sec} 秒]\n转写内容：${transcript}`;
+  } catch (e) {
+    return `[语音消息，时长 ${sec} 秒，转写失败：${e.message}]`;
+  }
+}
+
+// Build Claude content blocks for video message (thumbnail + audio transcript)
+async function processVideoMessage(message) {
+  const { file_key, image_key, duration, file_name } = JSON.parse(message.content);
+  const sec = Math.round((duration || 0) / 1000);
+  const blocks = [];
+
+  // Thumbnail → Claude vision
+  try {
+    const thumbBuf = await downloadResource(message.message_id, image_key, "image");
+    blocks.push({ type: "text", text: `用户发送了一个视频（${file_name || "video"}，时长 ${sec} 秒），封面如下：` });
+    blocks.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: thumbBuf.toString("base64") } });
+  } catch (e) {
+    blocks.push({ type: "text", text: `用户发送了一个视频（${file_name || "video"}，时长 ${sec} 秒）` });
+    console.error("[视频封面下载失败]", e.message);
+  }
+
+  // Audio extraction via local proxy → Feishu ASR
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (proxyUrl) {
+    try {
+      const videoBuf = await downloadResource(message.message_id, file_key, "file");
+      const proxyRes = await fetch(`${proxyUrl}/extract-audio`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-proxy-secret": process.env.PROXY_SECRET || "lark-proxy-secret-2026",
+        },
+        body: JSON.stringify({ video_base64: videoBuf.toString("base64") }),
+        signal: AbortSignal.timeout(90000),
+      });
+      const { audio_base64, format, error } = await proxyRes.json();
+      if (error) throw new Error(error);
+      if (audio_base64) {
+        const transcript = await feishuASR(Buffer.from(audio_base64, "base64"), format || "ogg_opus");
+        if (transcript) blocks.push({ type: "text", text: `视频音频转写：${transcript}` });
+      }
+    } catch (e) {
+      console.error("[视频音频提取失败]", e.message);
+      blocks.push({ type: "text", text: "（视频音频转写失败）" });
+    }
+  } else {
+    blocks.push({ type: "text", text: "（本地代理未连接，跳过音频转写）" });
+  }
+
+  return blocks;
+}
+
 // dreamina proxy call
 async function dreaminaExec(args) {
   const proxyUrl = process.env.LARK_PROXY_URL;
@@ -1272,11 +1386,12 @@ const chatHistory = new Map();
 const processedMsgIds = new Set();
 
 // Claude Agent loop
-async function runAgent(chatId, userMessage) {
+// userContent: string (text) or array of Claude content blocks (multi-modal)
+async function runAgent(chatId, userContent) {
   if (!chatHistory.has(chatId)) chatHistory.set(chatId, []);
   const history = chatHistory.get(chatId);
 
-  history.push({ role: "user", content: userMessage });
+  history.push({ role: "user", content: userContent });
   if (history.length > 20) history.splice(0, history.length - 20);
 
   const systemPrompt = `你是「经纬」，一个智能飞书助手，可以操作飞书的所有功能。
@@ -1380,29 +1495,36 @@ app.post("/webhook", async (req, res) => {
       processedMsgIds.delete(processedMsgIds.values().next().value);
     }
 
-    if (!["text", "post"].includes(message.message_type)) return;
+    const SUPPORTED = ["text", "post", "image", "audio", "media"];
+    if (!SUPPORTED.includes(message.message_type)) return;
 
     const content = JSON.parse(message.content);
-    let userText = "";
-    if (message.message_type === "text") {
-      userText = content.text.replace(/@[^\s]+\s*/g, "").trim();
-    } else {
-      // post 类型（富文本/引用消息）：拼接所有 text 节点
-      const lang = content.zh_cn || content.en_us || Object.values(content)[0];
-      if (lang?.content) {
-        userText = lang.content.flat()
-          .filter(e => e.tag === "text")
-          .map(e => e.text)
-          .join("")
-          .trim();
-      }
-    }
-    if (!userText) return;
-
     const chatId = message.chat_id;
-    console.log(`[收到] ${chatId}: ${userText}`);
 
-    const reply = await runAgent(chatId, userText);
+    // userContent: string or Claude content blocks array
+    let userContent;
+
+    if (message.message_type === "text") {
+      userContent = content.text.replace(/@[^\s]+\s*/g, "").trim();
+      if (!userContent) return;
+    } else if (message.message_type === "post") {
+      const lang = content.zh_cn || content.en_us || Object.values(content)[0];
+      userContent = lang?.content?.flat()
+        .filter(e => e.tag === "text")
+        .map(e => e.text)
+        .join("").trim() || "";
+      if (!userContent) return;
+    } else if (message.message_type === "image") {
+      userContent = await processImageMessage(message);
+    } else if (message.message_type === "audio") {
+      userContent = await processAudioMessage(message);
+    } else if (message.message_type === "media") {
+      userContent = await processVideoMessage(message);
+    }
+
+    console.log(`[收到:${message.message_type}] ${chatId}`);
+
+    const reply = await runAgent(chatId, userContent);
     console.log(`[回复] ${reply.slice(0, 100)}`);
 
     await replyToLark(msgId, reply);

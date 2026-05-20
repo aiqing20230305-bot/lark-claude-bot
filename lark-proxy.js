@@ -5,6 +5,9 @@
  */
 import express from "express";
 import { execSync } from "child_process";
+import fs from "fs";
+import os from "os";
+import path from "path";
 
 const app = express();
 app.use(express.json());
@@ -25,7 +28,7 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => res.json({
   ok: true,
   time: new Date().toISOString(),
-  services: ["lark-cli", "dreamina"],
+  services: ["lark-cli", "dreamina", "extract-audio"],
 }));
 
 function runCmd(bin, args, timeoutMs = 30000) {
@@ -82,6 +85,32 @@ app.post("/dreamina", (req, res) => {
   // 视频生成任务最长等 120 秒
   const timeout = args[0].includes("video") ? 120000 : 60000;
   res.json(runCmd(DREAMINA, args, timeout));
+});
+
+// ── 视频音频提取（ffmpeg） ─────────────────────────────────────────────────────
+app.post("/extract-audio", (req, res) => {
+  const { video_base64 } = req.body;
+  if (!video_base64) return res.status(400).json({ error: "video_base64 required" });
+
+  const tmpVideo = path.join(os.tmpdir(), `v_${Date.now()}.mp4`);
+  const tmpAudio = path.join(os.tmpdir(), `a_${Date.now()}.ogg`);
+
+  try {
+    fs.writeFileSync(tmpVideo, Buffer.from(video_base64, "base64"));
+    // 提取音频并转为 ogg_opus（飞书 ASR 支持格式）
+    execSync(
+      `ffmpeg -i "${tmpVideo}" -vn -acodec libopus -ar 16000 -ac 1 -b:a 32k "${tmpAudio}" -y`,
+      { timeout: 60000, stdio: "pipe" }
+    );
+    const audioData = fs.readFileSync(tmpAudio);
+    res.json({ audio_base64: audioData.toString("base64"), format: "ogg_opus" });
+  } catch (err) {
+    console.error("[extract-audio error]", err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    try { fs.unlinkSync(tmpVideo); } catch {}
+    try { fs.unlinkSync(tmpAudio); } catch {}
+  }
 });
 
 const PORT = process.env.PORT || 7788;
