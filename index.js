@@ -1400,6 +1400,23 @@ app.post("/webhook", async (req, res) => {
 
 app.get("/", (req, res) => res.send("Lark Claude Bot is running."));
 
+// Local proxy self-registration — called by start-proxy.sh when tunnel URL changes
+let dynamicProxyUrl = "";
+app.post("/register-proxy", (req, res) => {
+  const secret = req.headers["x-proxy-secret"];
+  if (secret !== (process.env.PROXY_SECRET || "lark-proxy-secret-2026")) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const { url } = req.body;
+  if (!url || !url.startsWith("https://")) {
+    return res.status(400).json({ error: "invalid url" });
+  }
+  dynamicProxyUrl = url;
+  process.env.LARK_PROXY_URL = url;
+  console.log(`[proxy] 注册新 URL: ${url}`);
+  res.json({ ok: true, url });
+});
+
 process.on("unhandledRejection", (reason) => {
   console.error("[UnhandledRejection]", reason);
 });
