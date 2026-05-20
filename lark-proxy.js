@@ -87,6 +87,34 @@ app.post("/dreamina", (req, res) => {
   res.json(runCmd(DREAMINA, args, timeout));
 });
 
+// ── 用 lark-cli 获取当前有效的 user access token ──────────────────────────────
+app.get("/token", (req, res) => {
+  // 通过 lark-cli 调用 authen API，lark-cli 内部会自动刷新 token
+  const result = runCmd(LARK_CLI, [
+    "api", "POST",
+    "/open-apis/authen/v1/refresh_access_token",
+    "--as", "bot",   // 用 bot 身份获取 app_access_token，然后通过它刷新 user token
+  ], 15000);
+
+  // 更简单：直接用 lark-cli 内部的 user token 发起一个 userinfo 调用
+  // 然后通过截获 Authorization header 来拿 token
+  // 由于 lark-cli 不暴露 token，改为让 bot 调用 proxy 的 exec 即可
+  // 返回 lark-cli 当前 user auth 状态
+  const statusResult = runCmd(LARK_CLI, ["auth", "status"], 10000);
+  const status = typeof statusResult.output === "object"
+    ? statusResult.output
+    : {};
+  const user = status?.identities?.user || {};
+  res.json({
+    ok: user.tokenStatus === "valid",
+    tokenStatus: user.tokenStatus,
+    expiresAt: user.expiresAt,
+    refreshExpiresAt: user.refreshExpiresAt,
+    userName: user.userName,
+    // token 值 lark-cli 不直接暴露，bot 应优先使用 /exec 而非直接 token
+  });
+});
+
 // ── 视频音频提取（ffmpeg） ─────────────────────────────────────────────────────
 app.post("/extract-audio", (req, res) => {
   const { video_base64 } = req.body;

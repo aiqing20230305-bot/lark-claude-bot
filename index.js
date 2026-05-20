@@ -91,15 +91,21 @@ async function getUserToken() {
 
 // User-level Feishu API call
 async function userApiCall(path, method = "GET", body = null) {
+  // Prefer proxy (lark-cli handles token internally, never expires on Railway)
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (proxyUrl) {
+    const args = ["api", method, path, "--as", "user"];
+    if (body) args.push("--data", JSON.stringify(body));
+    return larkProxyExec(args);
+  }
+
+  // Fallback: direct call with stored token
   const token = await getUserToken();
-  if (!token) return { error: "用户未授权，缺少 LARK_USER_ACCESS_TOKEN" };
+  if (!token) return { error: "用户未授权，且本地代理不可用" };
 
   const options = {
     method,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
   };
   if (body) options.body = JSON.stringify(body);
 
