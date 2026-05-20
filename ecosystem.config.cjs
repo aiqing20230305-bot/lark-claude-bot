@@ -1,0 +1,47 @@
+module.exports = {
+  apps: [
+    {
+      name: "lark-proxy",
+      script: "lark-proxy.js",
+      cwd: "/Users/zhangjingwei/Desktop/lark-claude-bot",
+      interpreter: "node",
+      watch: false,
+      autorestart: true,
+      max_restarts: 10,
+      restart_delay: 3000,
+      env: {
+        PORT: "7788",
+        PROXY_SECRET: "lark-proxy-secret-2026",
+        ATYPICA_API_KEY: "atypica_4c895d962850228287914767dd78bd66df0cc4a6da1acd0e5c4925c4f1e827f9",
+      },
+      log_file: "/Users/zhangjingwei/.claude/logs/lark-proxy.log",
+      error_file: "/Users/zhangjingwei/.claude/logs/lark-proxy-error.log",
+      time: true,
+    },
+    {
+      name: "cloudflared",
+      script: "start-proxy.sh",
+      cwd: "/Users/zhangjingwei/Desktop/lark-claude-bot",
+      interpreter: "bash",
+      watch: false,
+      autorestart: true,
+      max_restarts: 20,
+      restart_delay: 5000,
+      env: {
+        PROXY_SECRET: "lark-proxy-secret-2026",
+        RAILWAY_BOT_URL: "https://lark-claude-bot-93eq-production.up.railway.app",
+        HEARTBEAT_INTERVAL: "60",
+        // 让 cloudflared 绕过本地代理，直连 Cloudflare
+        NO_PROXY: "*",
+        no_proxy: "*",
+        http_proxy: "",
+        https_proxy: "",
+        HTTP_PROXY: "",
+        HTTPS_PROXY: "",
+      },
+      log_file: "/Users/zhangjingwei/.claude/logs/cloudflared.log",
+      error_file: "/Users/zhangjingwei/.claude/logs/cloudflared-error.log",
+      time: true,
+    },
+  ],
+};

@@ -270,6 +270,26 @@ async function larkProxyExec(args) {
   }
 }
 
+// Atypica hot trend proxy call
+async function atypicaExec(args) {
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (!proxyUrl) return { error: "未配置 LARK_PROXY_URL，请先启动本地代理" };
+
+  try {
+    const res = await fetch(`${proxyUrl}/atypica`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026",
+      },
+      body: JSON.stringify({ args }),
+    });
+    return await res.json();
+  } catch (err) {
+    return { error: `Atypica 代理连接失败: ${err.message}` };
+  }
+}
+
 // Tool implementations
 async function getCalendarEvents(startTime, endTime) {
   // Get primary calendar ID first
@@ -804,6 +824,28 @@ const tools = [
     },
   },
   {
+    name: "run_atypica",
+    description: `查询 Atypica 全球热点趋势数据。
+支持的命令：
+- 热点列表: args=["pulse","list","--limit","10","--order-by","heatScore"]
+- 按分类筛选: args=["pulse","list","--category","AI Tech","--limit","10"]
+- 中文热点: args=["pulse","list","--locale","zh-CN","--limit","10"]
+- 热点详情: args=["pulse","get","<id>"]
+- 获取分类: args=["pulse","categories"]
+返回 JSON 数据，包含 title、content（趋势分析）、heatScore、category、locale 等字段。`,
+    input_schema: {
+      type: "object",
+      properties: {
+        args: {
+          type: "array",
+          items: { type: "string" },
+          description: "atypica 命令参数，如 [\"pulse\",\"list\",\"--limit\",\"5\"]",
+        },
+      },
+      required: ["args"],
+    },
+  },
+  {
     name: "get_calendar_events",
     description: "获取用户的日历事件/日程安排。可以查看今天、本周或指定时间范围的会议和日程。",
     input_schema: {
@@ -1296,6 +1338,8 @@ async function executeTool(name, input) {
       return JSON.stringify(await dreaminaExec(input.args));
     case "run_lark_cli":
       return JSON.stringify(await larkProxyExec(input.args));
+    case "run_atypica":
+      return JSON.stringify(await atypicaExec(input.args));
     case "get_calendar_events":
       return JSON.stringify(await getCalendarEvents(input.start_timestamp, input.end_timestamp));
     case "get_tasks":
@@ -1414,7 +1458,14 @@ async function runAgent(chatId, userContent) {
   - 搜索用户: args=["contact","+search-user","--query","姓名","--as","user"]
   - 任意API: args=["api","GET或POST","/open-apis/路径","--as","user"]
 
-**第二优先级：其他工具**
+**第二优先级：run_atypica（热点趋势）**
+- 用户问"最近有什么热点"、"热门话题"、"趋势"时使用
+- 示例：
+  - 获取热点: args=["pulse","list","--limit","10","--order-by","heatScore"]
+  - 中文热点: args=["pulse","list","--locale","zh-CN","--limit","10"]
+  - 热点详情: args=["pulse","get","<id>"]
+
+**第三优先级：其他工具**
 - 只在 run_lark_cli 返回错误或代理不可用时，才使用其他工具
 
 ## 其他规则

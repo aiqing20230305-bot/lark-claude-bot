@@ -15,6 +15,7 @@ app.use(express.json());
 const SECRET = process.env.PROXY_SECRET || "lark-proxy-secret-2026";
 const LARK_CLI = process.env.LARK_CLI_PATH || "lark-cli";
 const DREAMINA = process.env.DREAMINA_PATH || "/Users/zhangjingwei/.local/bin/dreamina";
+const ATYPICA = process.env.ATYPICA_PATH || "atypica";
 
 // 鉴权中间件
 app.use((req, res, next) => {
@@ -28,7 +29,7 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => res.json({
   ok: true,
   time: new Date().toISOString(),
-  services: ["lark-cli", "dreamina", "extract-audio"],
+  services: ["lark-cli", "dreamina", "atypica", "extract-audio"],
 }));
 
 function runCmd(bin, args, timeoutMs = 30000) {
@@ -85,6 +86,25 @@ app.post("/dreamina", (req, res) => {
   // 视频生成任务最长等 120 秒
   const timeout = args[0].includes("video") ? 120000 : 60000;
   res.json(runCmd(DREAMINA, args, timeout));
+});
+
+// ── Atypica 热点趋势 ──────────────────────────────────────────────────────────
+const ATYPICA_ALLOWED = ["pulse"];
+
+app.post("/atypica", (req, res) => {
+  const { args } = req.body;
+  if (!Array.isArray(args) || args.length === 0) {
+    return res.status(400).json({ error: "args must be non-empty array" });
+  }
+  if (!ATYPICA_ALLOWED.includes(args[0])) {
+    return res.status(400).json({ error: `不允许的 atypica 命令: ${args[0]}` });
+  }
+  // 注入 --json 和 --no-update-check 保证机器可读输出
+  const fullArgs = [...args];
+  if (!fullArgs.includes("--json")) fullArgs.push("--json");
+  if (!fullArgs.includes("--no-update-check")) fullArgs.push("--no-update-check");
+
+  res.json(runCmd(ATYPICA, fullArgs, 30000));
 });
 
 // ── 用 lark-cli 获取当前有效的 user access token ──────────────────────────────
