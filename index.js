@@ -1380,10 +1380,23 @@ app.post("/webhook", async (req, res) => {
       processedMsgIds.delete(processedMsgIds.values().next().value);
     }
 
-    if (message.message_type !== "text") return;
+    if (!["text", "post"].includes(message.message_type)) return;
 
     const content = JSON.parse(message.content);
-    const userText = content.text.replace(/@[^\s]+\s*/g, "").trim();
+    let userText = "";
+    if (message.message_type === "text") {
+      userText = content.text.replace(/@[^\s]+\s*/g, "").trim();
+    } else {
+      // post 类型（富文本/引用消息）：拼接所有 text 节点
+      const lang = content.zh_cn || content.en_us || Object.values(content)[0];
+      if (lang?.content) {
+        userText = lang.content.flat()
+          .filter(e => e.tag === "text")
+          .map(e => e.text)
+          .join("")
+          .trim();
+      }
+    }
     if (!userText) return;
 
     const chatId = message.chat_id;
