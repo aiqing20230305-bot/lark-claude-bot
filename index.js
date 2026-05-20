@@ -829,9 +829,10 @@ const tools = [
 支持的命令：
 - 热点列表: args=["pulse","list","--limit","10","--order-by","heatScore"]
 - 按分类筛选: args=["pulse","list","--category","AI Tech","--limit","10"]
-- 中文热点: args=["pulse","list","--locale","zh-CN","--limit","10"]
+- 英文热点（当前仅支持 en-US）: args=["pulse","list","--locale","en-US","--limit","10"]
 - 热点详情: args=["pulse","get","<id>"]
 - 获取分类: args=["pulse","categories"]
+注意：locale 目前仅支持 en-US，zh-CN 暂不可用。
 返回 JSON 数据，包含 title、content（趋势分析）、heatScore、category、locale 等字段。`,
     input_schema: {
       type: "object",
@@ -1462,7 +1463,7 @@ async function runAgent(chatId, userContent) {
 - 用户问"最近有什么热点"、"热门话题"、"趋势"时使用
 - 示例：
   - 获取热点: args=["pulse","list","--limit","10","--order-by","heatScore"]
-  - 中文热点: args=["pulse","list","--locale","zh-CN","--limit","10"]
+  - 获取热点（locale 当前仅支持 en-US）: args=["pulse","list","--locale","en-US","--limit","10"]
   - 热点详情: args=["pulse","get","<id>"]
 
 **第三优先级：其他工具**
