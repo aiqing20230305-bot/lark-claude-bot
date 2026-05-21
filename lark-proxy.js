@@ -29,7 +29,7 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => res.json({
   ok: true,
   time: new Date().toISOString(),
-  services: ["lark-cli", "dreamina", "atypica", "extract-audio", "hot-topics"],
+  services: ["lark-cli", "dreamina", "atypica", "extract-audio", "transcribe", "hot-topics"],
 }));
 
 function runCmd(bin, args, timeoutMs = 30000) {
@@ -158,6 +158,41 @@ app.post("/extract-audio", (req, res) => {
   } finally {
     try { fs.unlinkSync(tmpVideo); } catch {}
     try { fs.unlinkSync(tmpAudio); } catch {}
+  }
+});
+
+// ── 本地 Whisper 语音转写 ─────────────────────────────────────────────────────
+app.post("/transcribe", (req, res) => {
+  const { audio_base64 } = req.body;
+  if (!audio_base64) return res.status(400).json({ error: "audio_base64 required" });
+
+  const ts = Date.now();
+  const tmpRaw = path.join(os.tmpdir(), `asr_raw_${ts}`);
+  const tmpMp3 = path.join(os.tmpdir(), `asr_${ts}.mp3`);
+
+  try {
+    fs.writeFileSync(tmpRaw, Buffer.from(audio_base64, "base64"));
+
+    // 转换为 16kHz 单声道 mp3（Whisper 最佳输入格式）
+    execSync(
+      `ffmpeg -i "${tmpRaw}" -ar 16000 -ac 1 -q:a 4 "${tmpMp3}" -y`,
+      { timeout: 30000, stdio: "pipe" }
+    );
+    fs.unlinkSync(tmpRaw);
+
+    // 本地 Whisper 转写
+    const transcript = execSync(
+      `python3 -c "import whisper,sys; m=whisper.load_model('base'); r=m.transcribe(sys.argv[1],fp16=False); print(r['text'].strip())" "${tmpMp3}"`,
+      { timeout: 120000, encoding: "utf8", stdio: "pipe" }
+    ).trim();
+
+    res.json({ transcript });
+  } catch (err) {
+    console.error("[transcribe error]", err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    try { fs.unlinkSync(tmpRaw); } catch {}
+    try { fs.unlinkSync(tmpMp3); } catch {}
   }
 });
 

@@ -161,6 +161,27 @@ async function feishuASR(audioBuffer, format = "ogg_opus") {
   return data.data?.recognition_text || "";
 }
 
+// Transcribe audio buffer — prefers local Whisper via proxy, falls back to Feishu ASR
+async function transcribeAudio(audioBuffer, feishuFormat = "ogg_opus") {
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (proxyUrl) {
+    const res = await fetch(`${proxyUrl}/transcribe`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-proxy-secret": process.env.PROXY_SECRET || "lark-proxy-secret-2026",
+      },
+      body: JSON.stringify({ audio_base64: audioBuffer.toString("base64") }),
+      signal: AbortSignal.timeout(120000),
+    });
+    const data = await res.json();
+    if (data.transcript !== undefined) return data.transcript;
+    throw new Error(data.error || "proxy transcribe failed");
+  }
+  // Fallback: Feishu official ASR
+  return feishuASR(audioBuffer, feishuFormat);
+}
+
 // Build Claude content blocks for image message
 async function processImageMessage(message) {
   const { image_key } = JSON.parse(message.content);
@@ -177,7 +198,7 @@ async function processAudioMessage(message) {
   const buf = await downloadResource(message.message_id, file_key, "file");
   const sec = Math.round((duration || 0) / 1000);
   try {
-    const transcript = await feishuASR(buf, "ogg_opus");
+    const transcript = await transcribeAudio(buf, "ogg_opus");
     return `[语音消息，时长 ${sec} 秒]\n转写内容：${transcript}`;
   } catch (e) {
     return `[语音消息，时长 ${sec} 秒，转写失败：${e.message}]`;
@@ -217,7 +238,7 @@ async function processVideoMessage(message) {
       const { audio_base64, format, error } = await proxyRes.json();
       if (error) throw new Error(error);
       if (audio_base64) {
-        const transcript = await feishuASR(Buffer.from(audio_base64, "base64"), format || "ogg_opus");
+        const transcript = await transcribeAudio(Buffer.from(audio_base64, "base64"), format || "ogg_opus");
         if (transcript) blocks.push({ type: "text", text: `视频音频转写：${transcript}` });
       }
     } catch (e) {
@@ -1636,11 +1657,29 @@ app.post("/webhook", async (req, res) => {
 
     await replyToLark(msgId, reply);
   } catch (err) {
-    console.error("[错误]", err.message);
+    console.error("[错误]", err.message, err.stack?.slice(0, 300));
+    try {
+      await replyToLark(msgId, `⚠️ 出错了：${err.message.slice(0, 200)}`);
+    } catch (replyErr) {
+      console.error("[回复失败]", replyErr.message);
+    }
   }
 });
 
 app.get("/", (req, res) => res.send("Lark Claude Bot is running."));
+
+// 配置诊断（不暴露值，只显示是否已设置）
+app.get("/config", (req, res) => {
+  res.json({
+    LARK_APP_ID: !!process.env.LARK_APP_ID,
+    LARK_APP_SECRET: !!process.env.LARK_APP_SECRET,
+    ANTHROPIC_API_KEY: !!process.env.ANTHROPIC_API_KEY,
+    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || "(not set)",
+    LARK_PROXY_URL: process.env.LARK_PROXY_URL || "(not set)",
+    USER_TOKEN: !!process.env.LARK_USER_ACCESS_TOKEN,
+    NODE_ENV: process.env.NODE_ENV || "development",
+  });
+});
 
 // Local proxy self-registration — called by start-proxy.sh when tunnel URL changes
 let dynamicProxyUrl = "";
