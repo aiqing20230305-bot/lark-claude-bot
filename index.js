@@ -1510,6 +1510,108 @@ async function executeTool(name, input) {
 const chatHistory = new Map();
 const processedMsgIds = new Set();
 
+// ── 启动恢复：处理 Railway 重启期间遗漏的消息 ────────────────────────────────
+// 只在代理注册后调用，确保 runAgent 可以正常调用飞书 API
+async function recoverMissedMessages() {
+  const LOOKBACK_SEC = 8 * 60; // 往回看 8 分钟
+  const startTimeSec = Math.floor(Date.now() / 1000) - LOOKBACK_SEC;
+
+  let token;
+  try {
+    token = await getAppToken();
+  } catch (err) {
+    console.log("[recovery] 无法获取 app token，跳过:", err.message);
+    return;
+  }
+
+  // 获取 bot 所在的聊天列表
+  let chats = [];
+  try {
+    const r = await fetch(
+      "https://open.feishu.cn/open-apis/im/v1/chats?page_size=50",
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const d = await r.json();
+    chats = d?.data?.items || [];
+  } catch (err) {
+    console.log("[recovery] 获取聊天列表失败，跳过:", err.message);
+    return;
+  }
+
+  if (chats.length === 0) return;
+  console.log(`[recovery] 检查 ${chats.length} 个聊天（最近 ${LOOKBACK_SEC / 60} 分钟）...`);
+  let recovered = 0;
+
+  for (const chat of chats) {
+    const chatId = chat.chat_id;
+    try {
+      const r = await fetch(
+        `https://open.feishu.cn/open-apis/im/v1/messages?container_id_type=chat&container_id=${chatId}&start_time=${startTimeSec}&sort_type=ByCreateTimeDesc&page_size=20`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const d = await r.json();
+      const messages = d?.data?.items || [];
+      if (messages.length === 0) continue;
+
+      // bot 已回复的时间点集合（秒）
+      const botReplyTimes = messages
+        .filter(m => m.sender?.sender_type === "app")
+        .map(m => parseInt(m.create_time, 10));
+
+      for (const msg of messages) {
+        if (msg.sender?.sender_type === "app") continue;
+        if (!["text", "post"].includes(msg.msg_type)) continue;
+
+        const msgTime = parseInt(msg.create_time, 10);
+        // bot 在此消息之后有过回复 → 视为已处理
+        if (botReplyTimes.some(t => t > msgTime)) continue;
+        // 本次进程已处理过 → 跳过
+        if (processedMsgIds.has(msg.message_id)) continue;
+
+        // 解析用户文本内容
+        let userContent = "";
+        try {
+          const content = JSON.parse(msg.body?.content || "{}");
+          if (msg.msg_type === "text") {
+            userContent = (content.text || "").replace(/@[^\s]+\s*/g, "").trim();
+          } else if (msg.msg_type === "post") {
+            const lang = content.zh_cn || content.en_us || Object.values(content)[0];
+            userContent = (lang?.content?.flat() || [])
+              .filter(e => e.tag === "text")
+              .map(e => e.text)
+              .join("").trim();
+          }
+        } catch { continue; }
+
+        if (!userContent) continue;
+
+        console.log(`[recovery] 恢复遗漏消息 ${msg.message_id?.slice(-8)} chat=${chatId}`);
+        processedMsgIds.add(msg.message_id);
+        recovered++;
+
+        try {
+          const reply = await Promise.race([
+            runAgent(chatId, userContent, null),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("处理超时（120秒）")), 120_000)
+            ),
+          ]);
+          await replyToLark(msg.message_id, reply);
+        } catch (err) {
+          console.error("[recovery] 处理消息失败:", err.message);
+          await replyToLark(msg.message_id, `⚠️ 出错了（启动恢复）：${err.message.slice(0, 150)}`).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.error(`[recovery] 检查聊天 ${chatId} 失败:`, err.message);
+    }
+  }
+
+  console.log(`[recovery] 完成，恢复了 ${recovered} 条遗漏消息`);
+}
+
+let _recoveryDone = false;
+
 // 根据工具调用生成进度提示文字
 function toolProgressMsg(name, input) {
   if (name === "run_lark_cli") {
@@ -1836,6 +1938,12 @@ app.post("/register-proxy", (req, res) => {
   process.env.LARK_PROXY_URL = url;
   console.log(`[proxy] 注册新 URL: ${url}`);
   res.json({ ok: true, url });
+
+  // 首次代理注册后触发启动恢复（代理就绪才能调用飞书 API）
+  if (!_recoveryDone) {
+    _recoveryDone = true;
+    recoverMissedMessages().catch(err => console.error("[recovery] 启动恢复失败:", err.message));
+  }
 });
 
 process.on("unhandledRejection", (reason) => {
