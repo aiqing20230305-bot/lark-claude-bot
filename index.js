@@ -1636,7 +1636,41 @@ app.post("/webhook", async (req, res) => {
 
   try {
     const event = body.event;
-    if (!event || body.header?.event_type !== "im.message.receive_v1") return;
+    const eventType = body.header?.event_type;
+
+    // ── 表情回复互动 ────────────────────────────────────────────────────────────
+    if (eventType === "im.message.reaction.created_v1") {
+      const emoji = event.reaction_type?.emoji_type || "";
+      const reactionMsgId = event.message_id;
+      // 只响应用户（非 bot 自己）的表情
+      if (!reactionMsgId || event.operator_type !== "user") return;
+
+      const REACTION_REPLIES = {
+        THUMBSUP:   "嗯！",
+        OK:         "收到~",
+        CLAP:       "谢谢鼓励！",
+        LOVE:       "❤️",
+        HAHA:       "😄",
+        FIRE:       "🔥 燃起来了",
+        JINGKONG:   "怎么了，吓到你了？",
+        CRY:        "怎么了…",
+        THINK:      "让我想想…",
+        ANGER:      "不满意？告诉我哪里需要改",
+        WOW:        "哈，没想到吧",
+        FACEPALM:   "…是不是搞错了什么",
+        ZZZ:        "在呢在呢，没睡着",
+        STRONG:     "💪",
+        PRAY:       "好的，尽力！",
+      };
+
+      const replyText = REACTION_REPLIES[emoji];
+      if (replyText) {
+        await replyToLark(reactionMsgId, replyText);
+      }
+      return;
+    }
+
+    if (!event || eventType !== "im.message.receive_v1") return;
 
     // Ignore messages sent by the bot itself to avoid infinite loops
     if (event.sender?.sender_type === "app") return;
