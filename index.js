@@ -1679,7 +1679,16 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`[收到:${message.message_type}] ${chatId}`);
 
-    const reply = await runAgent(chatId, userContent);
+    // 立即发「正在处理」提示，让用户知道 bot 已收到
+    replyToLark(msgId, "⏳ 收到，正在处理中...").catch(() => {});
+
+    const AGENT_TIMEOUT_MS = 120_000;
+    const reply = await Promise.race([
+      runAgent(chatId, userContent),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("处理超时（120秒），请稍后重试")), AGENT_TIMEOUT_MS)
+      ),
+    ]);
     console.log(`[回复] ${reply.slice(0, 100)}`);
 
     await replyToLark(msgId, reply);
