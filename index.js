@@ -1510,9 +1510,34 @@ async function executeTool(name, input) {
 const chatHistory = new Map();
 const processedMsgIds = new Set();
 
+// 根据工具调用生成进度提示文字
+function toolProgressMsg(name, input) {
+  if (name === "run_lark_cli") {
+    const args = input.args || [];
+    const path = args[2] || "";
+    const method = (args[1] || "").toUpperCase();
+    if (path.includes("/wiki/") || args[0] === "wiki")       return "📚 正在搜索知识库...";
+    if (path.includes("/docx/") || path.includes("/docs/"))  return "📄 正在读取文档内容...";
+    if (path.includes("/bitable/"))                           return "📊 正在读取多维表格...";
+    if (path.includes("/drive/"))                             return "📁 正在操作云空间文件...";
+    if (path.includes("/calendar/"))                          return "📅 正在查询日程...";
+    if (path.includes("/contact/") || args[0] === "contact") return "👤 正在查询通讯录...";
+    if (path.includes("/sheets/"))                            return "📊 正在操作电子表格...";
+    if (path.includes("/im/v1/messages") && method === "POST") return "💬 正在发送消息...";
+    if (path.includes("/im/v1/chats/search"))                 return "🔍 正在搜索群组...";
+    if (path.includes("/im/"))                                return "💬 正在查询消息...";
+    return "⚙️ 正在调用飞书 API...";
+  }
+  if (name === "get_hot_topics") return "🔥 正在获取国内热榜...";
+  if (name === "run_atypica")    return "📡 正在查询全球趋势...";
+  if (name === "run_dreamina")   return "🎨 正在生成图像/视频...";
+  return null;
+}
+
 // Claude Agent loop
 // userContent: string (text) or array of Claude content blocks (multi-modal)
-async function runAgent(chatId, userContent) {
+// onProgress: optional async (msg: string) => void，每步工具调用前回调
+async function runAgent(chatId, userContent, onProgress) {
   if (!chatHistory.has(chatId)) chatHistory.set(chatId, []);
   const history = chatHistory.get(chatId);
 
@@ -1553,6 +1578,7 @@ async function runAgent(chatId, userContent) {
 
   let messages = [...history];
   let finalReply = "";
+  let toolCallCount = 0;
 
   while (true) {
     const response = await anthropic.messages.create({
@@ -1570,6 +1596,12 @@ async function runAgent(chatId, userContent) {
       const toolResults = [];
       for (const block of response.content) {
         if (block.type === "tool_use") {
+          toolCallCount++;
+          // 从第 2 步开始发进度（第 1 步已有「⏳ 正在处理」）
+          if (onProgress && toolCallCount >= 2) {
+            const msg = toolProgressMsg(block.name, block.input);
+            if (msg) onProgress(`第 ${toolCallCount} 步：${msg}`).catch(() => {});
+          }
           console.log(`[工具] ${block.name}(${JSON.stringify(block.input)})`);
           const result = await executeTool(block.name, block.input);
           console.log(`[结果] ${result.slice(0, 200)}`);
@@ -1716,9 +1748,12 @@ app.post("/webhook", async (req, res) => {
     // 立即发「正在处理」提示，让用户知道 bot 已收到
     replyToLark(msgId, "⏳ 收到，正在处理中...").catch(() => {});
 
+    // 多步任务时实时推送进度
+    const onProgress = (msg) => replyToLark(msgId, msg);
+
     const AGENT_TIMEOUT_MS = 120_000;
     const reply = await Promise.race([
-      runAgent(chatId, userContent),
+      runAgent(chatId, userContent, onProgress),
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error("处理超时（120秒），请稍后重试")), AGENT_TIMEOUT_MS)
       ),
