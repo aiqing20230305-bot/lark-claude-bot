@@ -1640,6 +1640,7 @@ async function replyToLark(messageId, text) {
 
 // Recent event log (in-memory, last 20)
 const recentEvents = [];
+const recentErrors = [];
 
 // Webhook handler
 app.post("/webhook", async (req, res) => {
@@ -1746,7 +1747,12 @@ app.post("/webhook", async (req, res) => {
     console.log(`[收到:${message.message_type}] ${chatId}`);
 
     // 立即发「正在处理」提示，让用户知道 bot 已收到
-    replyToLark(msgId, "⏳ 收到，正在处理中...").catch(() => {});
+    replyToLark(msgId, "⏳ 收到，正在处理中...").catch((e) => {
+      const errEntry = { ts: new Date().toISOString(), stage: "ack", msg_id: msgId?.slice(-8), error: e.message, code: e.code };
+      recentErrors.push(errEntry);
+      if (recentErrors.length > 20) recentErrors.shift();
+      console.error("[ack失败]", JSON.stringify(errEntry));
+    });
 
     // 多步任务时实时推送进度
     const onProgress = (msg) => replyToLark(msgId, msg);
@@ -1762,11 +1768,17 @@ app.post("/webhook", async (req, res) => {
 
     await replyToLark(msgId, reply);
   } catch (err) {
+    const errEntry = { ts: new Date().toISOString(), stage: "agent", msg_id: msgId?.slice(-8), error: err.message, code: err.code };
+    recentErrors.push(errEntry);
+    if (recentErrors.length > 20) recentErrors.shift();
     console.error("[错误]", err.message, err.stack?.slice(0, 300));
     if (msgId) {
       try {
         await replyToLark(msgId, `⚠️ 出错了：${err.message.slice(0, 200)}`);
       } catch (replyErr) {
+        const re = { ts: new Date().toISOString(), stage: "reply", msg_id: msgId?.slice(-8), error: replyErr.message, code: replyErr.code };
+        recentErrors.push(re);
+        if (recentErrors.length > 20) recentErrors.shift();
         console.error("[回复失败]", replyErr.message);
       }
     }
@@ -1790,6 +1802,9 @@ app.get("/config", (req, res) => {
 
 // Recent webhook events — diagnose whether Feishu is sending events
 app.get("/events", (req, res) => res.json({ count: recentEvents.length, events: recentEvents }));
+
+// Recent errors — diagnose reply failures
+app.get("/errors", (req, res) => res.json({ count: recentErrors.length, errors: recentErrors }));
 
 // Test Anthropic API reachability from Railway
 app.get("/test-api", async (req, res) => {
