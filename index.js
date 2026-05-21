@@ -290,6 +290,26 @@ async function atypicaExec(args) {
   }
 }
 
+// Chinese hot topics via local proxy
+async function hotTopicsExec(platform = "all", limit = 20) {
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (!proxyUrl) return { error: "未配置 LARK_PROXY_URL，请先启动本地代理" };
+
+  try {
+    const res = await fetch(`${proxyUrl}/hot-topics`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026",
+      },
+      body: JSON.stringify({ platform, limit }),
+    });
+    return await res.json();
+  } catch (err) {
+    return { error: `热榜代理连接失败: ${err.message}` };
+  }
+}
+
 // Tool implementations
 async function getCalendarEvents(startTime, endTime) {
   // Get primary calendar ID first
@@ -847,6 +867,31 @@ const tools = [
     },
   },
   {
+    name: "get_hot_topics",
+    description: `获取国内各大平台的实时热榜。支持平台：
+- weibo: 微博热搜
+- bilibili: B站热门
+- toutiao: 今日头条热榜
+- baidu: 百度热搜
+- douyin: 抖音热点
+- all: 所有平台同时获取
+返回各平台 top N 热门话题，包含标题、热度值和链接。`,
+    input_schema: {
+      type: "object",
+      properties: {
+        platform: {
+          type: "string",
+          description: "平台名称：weibo / bilibili / toutiao / baidu / douyin / all",
+          enum: ["weibo", "bilibili", "toutiao", "baidu", "douyin", "all"],
+        },
+        limit: {
+          type: "number",
+          description: "每平台返回条数，默认 20，最多 50",
+        },
+      },
+    },
+  },
+  {
     name: "get_calendar_events",
     description: "获取用户的日历事件/日程安排。可以查看今天、本周或指定时间范围的会议和日程。",
     input_schema: {
@@ -1341,6 +1386,8 @@ async function executeTool(name, input) {
       return JSON.stringify(await larkProxyExec(input.args));
     case "run_atypica":
       return JSON.stringify(await atypicaExec(input.args));
+    case "get_hot_topics":
+      return JSON.stringify(await hotTopicsExec(input.platform || "all", input.limit || 20));
     case "get_calendar_events":
       return JSON.stringify(await getCalendarEvents(input.start_timestamp, input.end_timestamp));
     case "get_tasks":
@@ -1459,14 +1506,16 @@ async function runAgent(chatId, userContent) {
   - 搜索用户: args=["contact","+search-user","--query","姓名","--as","user"]
   - 任意API: args=["api","GET或POST","/open-apis/路径","--as","user"]
 
-**第二优先级：run_atypica（热点趋势）**
-- 用户问"最近有什么热点"、"热门话题"、"趋势"时使用
-- 示例：
-  - 获取热点: args=["pulse","list","--limit","10","--order-by","heatScore"]
-  - 获取热点（locale 当前仅支持 en-US）: args=["pulse","list","--locale","en-US","--limit","10"]
-  - 热点详情: args=["pulse","get","<id>"]
+**第二优先级：get_hot_topics（国内热榜）**
+- 用户问微博/B站/头条/百度/抖音热搜、国内热点时使用
+- 示例：platform="all" 获取所有平台；platform="weibo" 只看微博热搜
+- 支持平台：weibo / bilibili / toutiao / baidu / douyin / all
 
-**第三优先级：其他工具**
+**第三优先级：run_atypica（全球趋势）**
+- 用户问全球热点、英文趋势、海外话题时使用（locale 仅支持 en-US）
+- 示例：args=["pulse","list","--limit","10","--order-by","heatScore"]
+
+**第四优先级：其他工具**
 - 只在 run_lark_cli 返回错误或代理不可用时，才使用其他工具
 
 ## 其他规则
