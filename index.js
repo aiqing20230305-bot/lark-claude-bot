@@ -90,6 +90,12 @@ async function getUserToken() {
 }
 
 // User-level Feishu API call
+async function botApiCall(path, method = "GET", body = null) {
+  const args = ["api", method, path, "--as", "bot"];
+  if (body) args.push("--data", JSON.stringify(body));
+  return larkProxyExec(args);
+}
+
 async function userApiCall(path, method = "GET", body = null) {
   // Prefer proxy (lark-cli handles token internally, never expires on Railway)
   const proxyUrl = process.env.LARK_PROXY_URL;
@@ -687,7 +693,7 @@ async function getWikiContent(spaceId, nodeToken) {
 // ── Bitable (多维表格) ───────────────────────────────────────────────────────
 
 async function getBitableTables(appToken) {
-  const data = await userApiCall(`/open-apis/bitable/v1/apps/${appToken}/tables?page_size=20`);
+  const data = await botApiCall(`/open-apis/bitable/v1/apps/${appToken}/tables?page_size=20`);
   if (data.data?.items) {
     return data.data.items.map((t) => ({ name: t.name, table_id: t.table_id }));
   }
@@ -695,7 +701,7 @@ async function getBitableTables(appToken) {
 }
 
 async function getBitableRecords(appToken, tableId, pageSize = 20) {
-  const data = await userApiCall(
+  const data = await botApiCall(
     `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records?page_size=${pageSize}`
   );
   if (data.data?.items) {
@@ -705,7 +711,7 @@ async function getBitableRecords(appToken, tableId, pageSize = 20) {
 }
 
 async function createBitableRecord(appToken, tableId, fields) {
-  const data = await userApiCall(
+  const data = await botApiCall(
     `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records`,
     "POST",
     { fields }
@@ -715,7 +721,7 @@ async function createBitableRecord(appToken, tableId, fields) {
 }
 
 async function updateBitableRecord(appToken, tableId, recordId, fields) {
-  const data = await userApiCall(
+  const data = await botApiCall(
     `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records/${recordId}`,
     "PUT",
     { fields }
@@ -724,7 +730,7 @@ async function updateBitableRecord(appToken, tableId, recordId, fields) {
 }
 
 async function deleteBitableRecord(appToken, tableId, recordId) {
-  const data = await userApiCall(
+  const data = await botApiCall(
     `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records/${recordId}`,
     "DELETE"
   );
