@@ -1614,7 +1614,13 @@ app.post("/webhook", async (req, res) => {
   res.json({ code: 0 });
 
   // Log every incoming webhook for diagnostics
-  const logEntry = { ts: new Date().toISOString(), type: body.header?.event_type, sender_type: body.event?.sender?.sender_type };
+  const logEntry = {
+    ts: new Date().toISOString(),
+    type: body.header?.event_type,
+    sender_type: body.event?.sender?.sender_type,
+    msg_type: body.event?.message?.message_type,
+    msg_id: body.event?.message?.message_id?.slice(-8),
+  };
   recentEvents.push(logEntry);
   if (recentEvents.length > 20) recentEvents.shift();
   console.log("[webhook]", JSON.stringify(logEntry));
@@ -1700,6 +1706,21 @@ app.get("/config", (req, res) => {
 
 // Recent webhook events — diagnose whether Feishu is sending events
 app.get("/events", (req, res) => res.json({ count: recentEvents.length, events: recentEvents }));
+
+// Test Anthropic API reachability from Railway
+app.get("/test-api", async (req, res) => {
+  try {
+    const start = Date.now();
+    const resp = await anthropic.messages.create({
+      model: "pa/claude-sonnet-4-6",
+      max_tokens: 10,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    res.json({ ok: true, ms: Date.now() - start, text: resp.content?.[0]?.text });
+  } catch (err) {
+    res.json({ ok: false, error: err.message, status: err.status });
+  }
+});
 
 // Local proxy self-registration — called by start-proxy.sh when tunnel URL changes
 let dynamicProxyUrl = "";
