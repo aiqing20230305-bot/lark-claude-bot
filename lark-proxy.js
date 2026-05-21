@@ -29,7 +29,7 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => res.json({
   ok: true,
   time: new Date().toISOString(),
-  services: ["lark-cli", "dreamina", "atypica", "extract-audio", "transcribe", "hot-topics"],
+  services: ["lark-cli", "dreamina", "atypica", "extract-audio", "transcribe", "hot-topics", "generate-image"],
 }));
 
 function runCmd(bin, args, timeoutMs = 30000) {
@@ -307,6 +307,42 @@ app.post("/hot-topics", async (req, res) => {
     })
   );
   res.json(results);
+});
+
+// ── OpenAI gpt-image-1 图片生成 ───────────────────────────────────────────────
+app.post("/generate-image", async (req, res) => {
+  const { prompt, size = "1024x1024" } = req.body;
+  if (!prompt) return res.status(400).json({ error: "prompt required" });
+
+  // Read API key from Codex auth.json, fall back to env var
+  let apiKey = process.env.OPENAI_API_KEY;
+  try {
+    const authPath = path.join(os.homedir(), ".codex", "auth.json");
+    const auth = JSON.parse(fs.readFileSync(authPath, "utf8"));
+    if (auth.OPENAI_API_KEY) apiKey = auth.OPENAI_API_KEY;
+  } catch {}
+  if (!apiKey) return res.status(500).json({ error: "未找到 OpenAI API key（~/.codex/auth.json 或 OPENAI_API_KEY 环境变量）" });
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/images/generate", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ model: "gpt-image-1", prompt, n: 1, size, output_format: "b64_json" }),
+      signal: AbortSignal.timeout(120000),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) {
+      return res.status(500).json({ error: data.error?.message || `HTTP ${response.status}` });
+    }
+    const b64 = data.data?.[0]?.b64_json;
+    if (!b64) return res.status(500).json({ error: "No image data returned from OpenAI" });
+    res.json({ image_base64: b64 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 7788;

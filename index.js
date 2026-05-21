@@ -1402,10 +1402,29 @@ const tools = [
       required: ["department_id"],
     },
   },
+  {
+    name: "generate_image",
+    description: "用 OpenAI gpt-image-1 根据文字描述生成图片，并自动发送到飞书对话。适合用户说「画一张…」「生成图片…」「帮我做个图…」等需求。",
+    input_schema: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string",
+          description: "图片描述，建议使用详细英文描述以获得最佳效果，例如 'a cute orange cat sitting on a wooden desk, soft lighting, photorealistic'",
+        },
+        size: {
+          type: "string",
+          enum: ["1024x1024", "1024x1536", "1536x1024"],
+          description: "图片尺寸：1024x1024（正方形）、1024x1536（竖版）、1536x1024（横版），默认正方形",
+        },
+      },
+      required: ["prompt"],
+    },
+  },
 ];
 
 // Execute a tool call
-async function executeTool(name, input) {
+async function executeTool(name, input, ctx = {}) {
   switch (name) {
     case "run_dreamina":
       return JSON.stringify(await dreaminaExec(input.args));
@@ -1501,6 +1520,8 @@ async function executeTool(name, input) {
       return JSON.stringify(await getApprovalInstances(input.approval_code, input.page_size));
     case "get_approval_instance_detail":
       return JSON.stringify(await getApprovalInstanceDetail(input.instance_code));
+    case "generate_image":
+      return JSON.stringify(await generateImageExec(input.prompt, input.size, ctx.msgId));
     default:
       return `未知工具: ${name}`;
   }
@@ -1591,7 +1612,7 @@ async function recoverMissedMessages() {
 
         try {
           const reply = await Promise.race([
-            runAgent(chatId, userContent, null),
+            runAgent(chatId, userContent, null, msg.message_id),
             new Promise((_, reject) =>
               setTimeout(() => reject(new Error("处理超时（120秒）")), 120_000)
             ),
@@ -1639,7 +1660,7 @@ function toolProgressMsg(name, input) {
 // Claude Agent loop
 // userContent: string (text) or array of Claude content blocks (multi-modal)
 // onProgress: optional async (msg: string) => void，每步工具调用前回调
-async function runAgent(chatId, userContent, onProgress) {
+async function runAgent(chatId, userContent, onProgress, msgId = null) {
   if (!chatHistory.has(chatId)) chatHistory.set(chatId, []);
   const history = chatHistory.get(chatId);
 
@@ -1669,7 +1690,12 @@ async function runAgent(chatId, userContent, onProgress) {
 - 用户问全球热点、英文趋势、海外话题时使用（locale 仅支持 en-US）
 - 示例：args=["pulse","list","--limit","10","--order-by","heatScore"]
 
-**第四优先级：其他工具**
+**第四优先级：generate_image（AI 绘图）**
+- 用户说「画一张」「生成图片」「帮我做个图」「设计一张」时使用
+- prompt 尽量用详细英文描述，size 默认 1024x1024（横版用 1536x1024，竖版用 1024x1536）
+- 工具会直接把图片发送到飞书，成功后返回 image_key，告知用户已生成即可
+
+**第五优先级：其他工具**
 - 只在 run_lark_cli 返回错误或代理不可用时，才使用其他工具
 
 ## 其他规则
@@ -1705,7 +1731,7 @@ async function runAgent(chatId, userContent, onProgress) {
             if (msg) onProgress(`第 ${toolCallCount} 步：${msg}`).catch(() => {});
           }
           console.log(`[工具] ${block.name}(${JSON.stringify(block.input)})`);
-          const result = await executeTool(block.name, block.input);
+          const result = await executeTool(block.name, block.input, { msgId, chatId });
           console.log(`[结果] ${result.slice(0, 200)}`);
           toolResults.push({
             type: "tool_result",
@@ -1738,6 +1764,63 @@ async function replyToLark(messageId, text) {
       content: JSON.stringify({ text }),
     },
   });
+}
+
+// Upload base64 image to Feishu and return image_key
+async function uploadImageToFeishu(base64Data) {
+  const token = await getAppToken();
+  const imgBuffer = Buffer.from(base64Data, "base64");
+  const formData = new FormData();
+  formData.append("image_type", "message");
+  formData.append("image", new Blob([imgBuffer], { type: "image/png" }), "image.png");
+  const res = await fetch("https://open.feishu.cn/open-apis/im/v1/images", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+  const data = await res.json();
+  if (data.code !== 0) throw new Error(`飞书上传失败: ${data.msg} (code ${data.code})`);
+  return data.data.image_key;
+}
+
+// Reply to a Feishu message with an image
+async function replyImageToLark(messageId, imageKey) {
+  await larkClient.im.message.reply({
+    path: { message_id: messageId },
+    data: {
+      msg_type: "image",
+      content: JSON.stringify({ image_key: imageKey }),
+    },
+  });
+}
+
+// Generate image via local proxy (OpenAI gpt-image-1) and send to Feishu
+async function generateImageExec(prompt, size = "1024x1024", replyMsgId = null) {
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (!proxyUrl) return { error: "本地代理未连接，无法生成图片" };
+  try {
+    const res = await fetch(`${proxyUrl}/generate-image`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-proxy-secret": process.env.PROXY_SECRET || "lark-proxy-secret-2026",
+      },
+      body: JSON.stringify({ prompt, size }),
+      signal: AbortSignal.timeout(120000),
+    });
+    const data = await res.json();
+    if (data.error) return { error: data.error };
+
+    const imageKey = await uploadImageToFeishu(data.image_base64);
+    if (replyMsgId) {
+      await replyImageToLark(replyMsgId, imageKey).catch((e) =>
+        console.error("[图片回复失败]", e.message)
+      );
+    }
+    return { success: true, image_key: imageKey, status: "图片已发送到飞书" };
+  } catch (err) {
+    return { error: err.message };
+  }
 }
 
 // Recent event log (in-memory, last 20)
@@ -1861,7 +1944,7 @@ app.post("/webhook", async (req, res) => {
 
     const AGENT_TIMEOUT_MS = 120_000;
     const reply = await Promise.race([
-      runAgent(chatId, userContent, onProgress),
+      runAgent(chatId, userContent, onProgress, msgId),
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error("处理超时（120秒），请稍后重试")), AGENT_TIMEOUT_MS)
       ),
