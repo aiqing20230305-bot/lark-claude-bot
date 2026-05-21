@@ -1600,6 +1600,9 @@ async function replyToLark(messageId, text) {
   });
 }
 
+// Recent event log (in-memory, last 20)
+const recentEvents = [];
+
 // Webhook handler
 app.post("/webhook", async (req, res) => {
   const body = req.body;
@@ -1610,12 +1613,24 @@ app.post("/webhook", async (req, res) => {
 
   res.json({ code: 0 });
 
+  // Log every incoming webhook for diagnostics
+  const logEntry = { ts: new Date().toISOString(), type: body.header?.event_type, sender_type: body.event?.sender?.sender_type };
+  recentEvents.push(logEntry);
+  if (recentEvents.length > 20) recentEvents.shift();
+  console.log("[webhook]", JSON.stringify(logEntry));
+
+  // Declare msgId outside try so catch block can reference it
+  let msgId;
+
   try {
     const event = body.event;
     if (!event || body.header?.event_type !== "im.message.receive_v1") return;
 
+    // Ignore messages sent by the bot itself to avoid infinite loops
+    if (event.sender?.sender_type === "app") return;
+
     const message = event.message;
-    const msgId = message.message_id;
+    msgId = message.message_id;
 
     if (processedMsgIds.has(msgId)) return;
     processedMsgIds.add(msgId);
@@ -1658,10 +1673,12 @@ app.post("/webhook", async (req, res) => {
     await replyToLark(msgId, reply);
   } catch (err) {
     console.error("[错误]", err.message, err.stack?.slice(0, 300));
-    try {
-      await replyToLark(msgId, `⚠️ 出错了：${err.message.slice(0, 200)}`);
-    } catch (replyErr) {
-      console.error("[回复失败]", replyErr.message);
+    if (msgId) {
+      try {
+        await replyToLark(msgId, `⚠️ 出错了：${err.message.slice(0, 200)}`);
+      } catch (replyErr) {
+        console.error("[回复失败]", replyErr.message);
+      }
     }
   }
 });
@@ -1680,6 +1697,9 @@ app.get("/config", (req, res) => {
     NODE_ENV: process.env.NODE_ENV || "development",
   });
 });
+
+// Recent webhook events — diagnose whether Feishu is sending events
+app.get("/events", (req, res) => res.json({ count: recentEvents.length, events: recentEvents }));
 
 // Local proxy self-registration — called by start-proxy.sh when tunnel URL changes
 let dynamicProxyUrl = "";
