@@ -1583,6 +1583,15 @@ async function recoverMissedMessages() {
         if (msg.sender?.sender_type === "app") continue;
         if (!["text", "post"].includes(msg.msg_type)) continue;
 
+        // 群聊只恢复 @bot 的消息
+        if (chat.chat_type === "group") {
+          const mentions = msg.mentions || [];
+          const mentioned = botOpenId
+            ? mentions.some(m => m.id?.open_id === botOpenId)
+            : mentions.length > 0;
+          if (!mentioned) continue;
+        }
+
         const msgTime = parseInt(msg.create_time, 10);
         // bot 在此消息之后有过回复 → 视为已处理
         if (botReplyTimes.some(t => t > msgTime)) continue;
@@ -1823,6 +1832,24 @@ async function generateImageExec(prompt, size = "1024x1024", replyMsgId = null) 
   }
 }
 
+// Bot's own open_id — used to detect @mentions in group chats
+let botOpenId = "";
+
+async function fetchBotInfo() {
+  try {
+    const token = await getAppToken();
+    const res = await fetch("https://open.feishu.cn/open-apis/bot/v3/info", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    botOpenId = data.bot?.open_id || "";
+    if (botOpenId) console.log(`✅ Bot open_id: ...${botOpenId.slice(-8)}`);
+    else console.warn("[bot-info] 未能获取 bot open_id，群聊将按 mentions 非空判断");
+  } catch (err) {
+    console.error("[bot-info] 获取失败:", err.message);
+  }
+}
+
 // Recent event log (in-memory, last 20)
 const recentEvents = [];
 const recentErrors = [];
@@ -1907,6 +1934,15 @@ app.post("/webhook", async (req, res) => {
 
     const content = JSON.parse(message.content);
     const chatId = message.chat_id;
+
+    // 群聊只响应 @提及，p2p 直聊全部响应
+    if (message.chat_type === "group") {
+      const mentions = message.mentions || [];
+      const mentioned = botOpenId
+        ? mentions.some(m => m.id?.open_id === botOpenId)
+        : mentions.length > 0;
+      if (!mentioned) return;
+    }
 
     // userContent: string or Claude content blocks array
     let userContent;
@@ -2056,5 +2092,7 @@ app.listen(PORT, () => {
     } catch (err) {
       console.error("[启动 Token 刷新失败]", err.message);
     }
+    // 获取 bot open_id 用于群聊 @判断
+    await fetchBotInfo().catch(err => console.error("[fetchBotInfo 失败]", err.message));
   })();
 });
