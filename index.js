@@ -1731,7 +1731,7 @@ async function recoverMissedMessages() {
           if (msg.msg_type === "text") {
             userContent = (content.text || "").replace(/@[^\s]+\s*/g, "").trim();
           } else if (msg.msg_type === "post") {
-            const lang = content.zh_cn || content.en_us || Object.values(content)[0];
+            const lang = content.zh_cn || content.en_us || content;
             userContent = (lang?.content?.flat() || [])
               .filter(e => e.tag === "text")
               .map(e => e.text)
@@ -2228,7 +2228,8 @@ app.post("/webhook", async (req, res) => {
       userContent = content.text.replace(/@[^\s]+\s*/g, "").trim();
       if (!userContent) return;
     } else if (message.message_type === "post") {
-      const lang = content.zh_cn || content.en_us || Object.values(content)[0];
+      // Feishu post: either {zh_cn:{content:[...]}} or directly {title:"",content:[...]}
+      const lang = content.zh_cn || content.en_us || content;
       const blocks = (lang?.content || []).flat();
       const textContent = blocks.filter(e => e.tag === "text").map(e => e.text).join("").trim();
       const imgKeys = blocks.filter(e => e.tag === "img" && e.image_key).map(e => e.image_key);
