@@ -309,40 +309,66 @@ app.post("/hot-topics", async (req, res) => {
   res.json(results);
 });
 
-// ── OpenAI gpt-image-1 图片生成 ───────────────────────────────────────────────
+// ── gpt-image-1（Images 2.0）via codex exec ────────────────────────────────────
+const CODEX_BIN = process.env.CODEX_PATH || "codex";
+const GENERATED_IMAGES_DIR = path.join(os.homedir(), ".codex", "generated_images");
+
+function findNewestImage(since) {
+  if (!fs.existsSync(GENERATED_IMAGES_DIR)) return null;
+  let newest = null;
+  let newestMtime = 0;
+  for (const session of fs.readdirSync(GENERATED_IMAGES_DIR)) {
+    const sessionDir = path.join(GENERATED_IMAGES_DIR, session);
+    try {
+      for (const file of fs.readdirSync(sessionDir)) {
+        if (!file.endsWith(".png") && !file.endsWith(".jpg") && !file.endsWith(".webp")) continue;
+        const full = path.join(sessionDir, file);
+        const mtime = fs.statSync(full).mtimeMs;
+        if (mtime > since && mtime > newestMtime) {
+          newestMtime = mtime;
+          newest = full;
+        }
+      }
+    } catch {}
+  }
+  return newest;
+}
+
 app.post("/generate-image", async (req, res) => {
   const { prompt, size = "1024x1024" } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt required" });
 
-  // Read API key from Codex auth.json, fall back to env var
-  let apiKey = process.env.OPENAI_API_KEY;
-  try {
-    const authPath = path.join(os.homedir(), ".codex", "auth.json");
-    const auth = JSON.parse(fs.readFileSync(authPath, "utf8"));
-    if (auth.OPENAI_API_KEY) apiKey = auth.OPENAI_API_KEY;
-  } catch {}
-  if (!apiKey) return res.status(500).json({ error: "未找到 OpenAI API key（~/.codex/auth.json 或 OPENAI_API_KEY 环境变量）" });
+  const sizeHint = size !== "1024x1024" ? ` (size: ${size})` : "";
+  const codexPrompt = `Generate an image: ${prompt}${sizeHint}. Only generate the image, do not explain anything.`;
+
+  const startTime = Date.now();
+  console.log(`[generate-image] Running codex exec, prompt length=${codexPrompt.length}`);
 
   try {
-    const response = await fetch("https://api.openai.com/v1/images/generate", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({ model: "gpt-image-1", prompt, n: 1, size, output_format: "b64_json" }),
-      signal: AbortSignal.timeout(120000),
+    // codex exec runs non-interactively; saves image to ~/.codex/generated_images/
+    execSync(`${CODEX_BIN} exec ${JSON.stringify(codexPrompt)}`, {
+      encoding: "utf8",
+      timeout: 180000,
+      env: { ...process.env, PATH: process.env.PATH },
+      stdio: "pipe",
     });
-    const data = await response.json();
-    if (!response.ok || data.error) {
-      return res.status(500).json({ error: data.error?.message || `HTTP ${response.status}` });
-    }
-    const b64 = data.data?.[0]?.b64_json;
-    if (!b64) return res.status(500).json({ error: "No image data returned from OpenAI" });
-    res.json({ image_base64: b64 });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    // codex exec may exit non-zero but still generate the image — check for output first
+    const output = (err.stdout || "") + (err.stderr || "");
+    console.log(`[generate-image] codex exec exited with error (may be OK): ${output.slice(0, 300)}`);
   }
+
+  // Give filesystem a moment to flush
+  await new Promise((r) => setTimeout(r, 500));
+
+  const imgPath = findNewestImage(startTime - 2000);
+  if (!imgPath) {
+    return res.status(500).json({ error: "codex exec 未生成图片文件，请检查 Codex 是否登录并有 ChatGPT Plus" });
+  }
+
+  console.log(`[generate-image] Found image: ${imgPath}`);
+  const b64 = fs.readFileSync(imgPath).toString("base64");
+  res.json({ image_base64: b64, source_path: imgPath });
 });
 
 const PORT = process.env.PORT || 7788;
