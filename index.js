@@ -2007,6 +2007,8 @@ async function fetchBotInfo() {
 // Recent event log (in-memory, last 20)
 const recentEvents = [];
 const recentErrors = [];
+// Last 5 post message raw payloads (for debugging content structure)
+const recentPostPayloads = [];
 
 // Webhook handler
 app.post("/webhook", async (req, res) => {
@@ -2024,11 +2026,23 @@ app.post("/webhook", async (req, res) => {
     type: body.header?.event_type,
     sender_type: body.event?.sender?.sender_type,
     msg_type: body.event?.message?.message_type,
+    chat_type: body.event?.message?.chat_type,
     msg_id: body.event?.message?.message_id?.slice(-8),
   };
   recentEvents.push(logEntry);
   if (recentEvents.length > 20) recentEvents.shift();
   console.log("[webhook]", JSON.stringify(logEntry));
+
+  // Capture post message payloads for content structure debugging
+  if (body.event?.message?.message_type === "post") {
+    const snap = {
+      ts: logEntry.ts,
+      msg_id: logEntry.msg_id,
+      content_raw: body.event.message.content?.slice(0, 500),
+    };
+    recentPostPayloads.push(snap);
+    if (recentPostPayloads.length > 5) recentPostPayloads.shift();
+  }
 
   // Declare msgId outside try so catch block can reference it
   let msgId;
@@ -2077,7 +2091,10 @@ app.post("/webhook", async (req, res) => {
     const message = event.message;
     msgId = message.message_id;
 
-    if (processedMsgIds.has(msgId)) return;
+    if (processedMsgIds.has(msgId)) {
+      console.log(`[dedup] 已处理过: ${msgId?.slice(-8)}`);
+      return;
+    }
     processedMsgIds.add(msgId);
     if (processedMsgIds.size > 1000) {
       processedMsgIds.delete(processedMsgIds.values().next().value);
@@ -2110,10 +2127,11 @@ app.post("/webhook", async (req, res) => {
       const textContent = blocks.filter(e => e.tag === "text").map(e => e.text).join("").trim();
       const imgKeys = blocks.filter(e => e.tag === "img" && e.image_key).map(e => e.image_key);
 
+      console.log(`[post] textLen=${textContent.length} imgKeys=${imgKeys.length}`);
       if (imgKeys.length === 0) {
         // 纯文字 post
         userContent = textContent;
-        if (!userContent) return;
+        if (!userContent) { console.log("[post] 纯文字内容为空，跳过"); return; }
       } else {
         // 包含图片的 post — 构建多模态内容
         const parts = [];
@@ -2126,7 +2144,7 @@ app.post("/webhook", async (req, res) => {
             console.error("[post-img] 嵌套图片下载失败:", err.message);
           }
         }
-        if (parts.length === 0) return;
+        if (parts.length === 0) { console.log("[post] parts 为空，跳过"); return; }
         userContent = parts;
       }
     } else if (message.message_type === "image") {
@@ -2198,6 +2216,9 @@ app.get("/events", (req, res) => res.json({ count: recentEvents.length, events: 
 
 // Recent errors — diagnose reply failures
 app.get("/errors", (req, res) => res.json({ count: recentErrors.length, errors: recentErrors }));
+
+// Post message content debugger — shows raw content structure of last 5 post messages
+app.get("/post-debug", (req, res) => res.json(recentPostPayloads));
 
 // Test Anthropic API reachability from Railway
 app.get("/test-api", async (req, res) => {
