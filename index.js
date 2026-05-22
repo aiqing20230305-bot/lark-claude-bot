@@ -337,6 +337,26 @@ async function hotTopicsExec(platform = "all", limit = 20) {
   }
 }
 
+async function webpageExec(url, maxChars = 8000) {
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (!proxyUrl) return { error: "未配置 LARK_PROXY_URL，请先启动本地代理" };
+
+  try {
+    const res = await fetch(`${proxyUrl}/fetch-url`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026",
+      },
+      body: JSON.stringify({ url, max_chars: maxChars }),
+      signal: AbortSignal.timeout(20000),
+    });
+    return await res.json();
+  } catch (err) {
+    return { error: `网页抓取失败: ${err.message}`, url };
+  }
+}
+
 // Tool implementations
 async function getCalendarEvents(startTime, endTime) {
   // Get primary calendar ID first
@@ -1456,6 +1476,28 @@ const tools = [
       required: ["media_type", "prompt_en", "style", "aspect_ratio", "engine"],
     },
   },
+  {
+    name: "fetch_webpage",
+    description: `抓取任意网页的文本内容，用于：
+- 用户分享一个 URL 让你分析/总结
+- 查看某个网页的最新信息
+- 读取文章、博客、新闻、文档内容
+注意：不支持需要登录的页面，JS 渲染的 SPA 可能内容不完整。`,
+    input_schema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "要抓取的完整 URL，包含 https://",
+        },
+        max_chars: {
+          type: "number",
+          description: "返回文本最大字符数，默认 8000，最大 20000",
+        },
+      },
+      required: ["url"],
+    },
+  },
 ];
 
 // Execute a tool call
@@ -1559,6 +1601,8 @@ async function executeTool(name, input, ctx = {}) {
       return JSON.stringify(await generateImageExec(input.prompt, input.size, ctx.msgId));
     case "generate_creative_content":
       return JSON.stringify(await generateCreativeContent(input, ctx));
+    case "fetch_webpage":
+      return JSON.stringify(await webpageExec(input.url, input.max_chars));
     default:
       return `未知工具: ${name}`;
   }
@@ -1700,6 +1744,7 @@ function toolProgressMsg(name, input) {
   if (name === "get_hot_topics") return "🔥 正在获取国内热榜...";
   if (name === "run_atypica")    return "📡 正在查询全球趋势...";
   if (name === "run_dreamina")             return "🎨 正在生成图像/视频...";
+  if (name === "fetch_webpage")            return `🌐 正在读取网页：${input?.url?.slice(0, 60)}...`;
   if (name === "generate_creative_content") {
     const type = input?.media_type === "video" ? "视频" : "图片";
     const engine = input?.engine === "dreamina" ? "Dreamina" : "GPT-Image";
@@ -1859,7 +1904,12 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
 
   图片生成成功后直接告知用户；视频生成需轮询，完成后告知下载链接或结果。
 
-**第五优先级：其他工具**
+**第五优先级：fetch_webpage（读取网页）**
+- 用户分享 URL 或说「帮我看看这个网页/文章」时使用
+- 抓取后用中文总结关键信息，超长内容只总结重点
+- 不支持需要登录的页面；微信公众号/知乎等可能有反爬
+
+**第六优先级：其他工具**
 - 只在 run_lark_cli 返回错误或代理不可用时，才使用其他工具
 
 ## 其他规则

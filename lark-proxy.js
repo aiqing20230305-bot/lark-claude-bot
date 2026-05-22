@@ -29,7 +29,7 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => res.json({
   ok: true,
   time: new Date().toISOString(),
-  services: ["lark-cli", "dreamina", "atypica", "extract-audio", "transcribe", "hot-topics", "generate-image"],
+  services: ["lark-cli", "dreamina", "atypica", "extract-audio", "transcribe", "hot-topics", "generate-image", "fetch-url"],
 }));
 
 function runCmd(bin, args, timeoutMs = 30000) {
@@ -193,6 +193,70 @@ app.post("/transcribe", (req, res) => {
   } finally {
     try { fs.unlinkSync(tmpRaw); } catch {}
     try { fs.unlinkSync(tmpMp3); } catch {}
+  }
+});
+
+// ── 网页抓取 ──────────────────────────────────────────────────────────────────
+const FETCH_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const MAX_TEXT = 8000; // 返回纯文本最大字符数
+
+function htmlToText(html) {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<head[\s\S]*?<\/head>/gi, "")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, "")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/?(p|div|h[1-6]|li|tr|td|th|section|article|header)[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&[a-z]+;/gi, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+app.post("/fetch-url", async (req, res) => {
+  const { url, max_chars = MAX_TEXT } = req.body;
+  if (!url) return res.status(400).json({ error: "url required" });
+
+  // 检查是否需要走本地代理（海外域名）
+  const proxyUrl = process.env.https_proxy || process.env.http_proxy || "";
+  const fetchOptions = {
+    headers: {
+      "User-Agent": FETCH_UA,
+      "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    },
+    signal: AbortSignal.timeout(15000),
+  };
+
+  try {
+    const r = await fetch(url, fetchOptions);
+    if (!r.ok) return res.status(502).json({ error: `HTTP ${r.status} ${r.statusText}`, url });
+
+    const contentType = r.headers.get("content-type") || "";
+    let text;
+    if (contentType.includes("application/json")) {
+      text = await r.text();
+    } else {
+      const html = await r.text();
+      text = htmlToText(html);
+    }
+
+    const truncated = text.length > max_chars;
+    res.json({
+      url,
+      content: text.slice(0, max_chars),
+      truncated,
+      total_chars: text.length,
+    });
+  } catch (err) {
+    console.error("[fetch-url error]", url, err.message);
+    res.status(500).json({ error: err.message, url });
   }
 });
 
