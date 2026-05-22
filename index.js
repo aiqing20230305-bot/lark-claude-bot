@@ -282,6 +282,21 @@ async function larkProxyExec(args) {
   const proxyUrl = process.env.LARK_PROXY_URL;
   if (!proxyUrl) return { error: "未配置 LARK_PROXY_URL，请先启动本地代理并设置环境变量" };
 
+  // Guard: never impersonate the user for write operations on IM/Calendar/Bitable
+  // Read ops (GET) may use --as user for personal data; writes must be --as bot
+  const safeArgs = [...args];
+  const asIdx = safeArgs.indexOf("--as");
+  if (asIdx !== -1 && safeArgs[asIdx + 1] === "user") {
+    const method = (safeArgs[1] || "").toUpperCase();
+    const path = safeArgs[2] || "";
+    const isWrite = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
+    const isSensitivePath = path.includes("/im/v1/messages") || path.includes("/im/v1/chats");
+    if (isWrite && isSensitivePath) {
+      console.warn(`[guard] 阻止用用户身份写 IM，改为 bot: ${method} ${path}`);
+      safeArgs[asIdx + 1] = "bot";
+    }
+  }
+
   try {
     const res = await fetch(`${proxyUrl}/exec`, {
       method: "POST",
@@ -289,7 +304,7 @@ async function larkProxyExec(args) {
         "Content-Type": "application/json",
         "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026",
       },
-      body: JSON.stringify({ args }),
+      body: JSON.stringify({ args: safeArgs }),
     });
     return await res.json();
   } catch (err) {
@@ -461,7 +476,7 @@ async function getChats() {
 }
 
 async function sendMessage(chatId, text) {
-  const data = await userApiCall("/open-apis/im/v1/messages?receive_id_type=chat_id", "POST", {
+  const data = await botApiCall("/open-apis/im/v1/messages?receive_id_type=chat_id", "POST", {
     receive_id: chatId,
     msg_type: "text",
     content: JSON.stringify({ text }),
@@ -489,7 +504,7 @@ async function getMessages(chatId, pageSize = 20) {
 }
 
 async function sendDirectMessage(openId, text) {
-  const data = await userApiCall("/open-apis/im/v1/messages?receive_id_type=open_id", "POST", {
+  const data = await botApiCall("/open-apis/im/v1/messages?receive_id_type=open_id", "POST", {
     receive_id: openId,
     msg_type: "text",
     content: JSON.stringify({ text }),
@@ -637,14 +652,14 @@ async function pinMessage(chatId, messageId) {
 }
 
 async function addReaction(messageId, reactionType) {
-  const data = await userApiCall(`/open-apis/im/v1/messages/${messageId}/reactions`, "POST", {
+  const data = await botApiCall(`/open-apis/im/v1/messages/${messageId}/reactions`, "POST", {
     reaction_type: { emoji_type: reactionType },
   });
   return data.code === 0 ? "表情回应已添加" : `失败: ${data.msg}`;
 }
 
 async function forwardMessage(messageId, chatId) {
-  const data = await userApiCall(`/open-apis/im/v1/messages/${messageId}/forward`, "POST", {
+  const data = await botApiCall(`/open-apis/im/v1/messages/${messageId}/forward`, "POST", {
     receive_id: chatId,
     receive_id_type: "chat_id",
   });
@@ -1910,7 +1925,12 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
   - 读群消息: args=["api","GET","/open-apis/im/v1/messages","--params","{\\"container_id_type\\":\\"chat\\",\\"container_id\\":\\"CHAT_ID\\",\\"page_size\\":20}","--as","user"]
   - 查日程: args=["calendar","+agenda","--as","user"]
   - 搜索用户: args=["contact","+search-user","--query","姓名","--as","user"]
-  - 任意API: args=["api","GET或POST","/open-apis/路径","--as","user"]
+  - 读取API: args=["api","GET","/open-apis/路径","--as","user"]
+  - 发送消息: args=["api","POST","/open-apis/im/v1/messages?receive_id_type=chat_id","--as","bot","--data","{\\"receive_id\\":\\"CHAT_ID\\",\\"msg_type\\":\\"text\\",\\"content\\":\\"{\\\\\\"text\\\\\\":\\\\\\"内容\\\\\\"}\\"}"]
+
+⚠️ 身份规则：
+- --as user：仅用于 GET 查询（读日历、读消息、查通讯录）
+- --as bot：所有写操作（发消息、创建群、删除等）必须用 bot 身份，严禁用 user 身份代替用户发送任何消息
 
 **第二优先级：get_hot_topics（国内热榜）**
 - 用户问微博/B站/头条/百度/抖音热搜、国内热点时使用
@@ -2212,13 +2232,16 @@ app.post("/webhook", async (req, res) => {
     const content = JSON.parse(message.content);
     const chatId = message.chat_id;
 
-    // 群聊只响应 @提及，p2p 直聊全部响应
-    if (message.chat_type === "group") {
+    // 非 p2p 聊天（群聊/部门群等）必须 @bot 才响应
+    if (message.chat_type !== "p2p") {
       const mentions = message.mentions || [];
       const mentioned = botOpenId
         ? mentions.some(m => m.id?.open_id === botOpenId)
         : mentions.length > 0;
-      if (!mentioned) return;
+      if (!mentioned) {
+        console.log(`[group-filter] 未 @bot，忽略 chat_type=${message.chat_type}`);
+        return;
+      }
     }
 
     // userContent: string or Claude content blocks array
