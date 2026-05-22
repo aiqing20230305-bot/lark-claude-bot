@@ -495,9 +495,162 @@ app.post("/generate-image", async (req, res) => {
   res.json({ image_base64: b64, source_path: imgPath });
 });
 
+// ── NotebookLM MCP 桥（HTTP 模式，端口 3747）────────────────────────────────
+const NLM_PORT = process.env.NOTEBOOKLM_PORT || 3747;
+const NLM_URL  = `http://127.0.0.1:${NLM_PORT}/mcp`;
+const NLM_HEADERS = {
+  "Content-Type": "application/json",
+  "Accept": "application/json, text/event-stream",
+};
+
+let nlmSessionId = null;
+
+// Parse SSE or plain JSON response
+function parseNlmResponse(text) {
+  const dataLine = text.split("\n").find((l) => l.startsWith("data: "));
+  if (dataLine) {
+    try { return JSON.parse(dataLine.slice(6)); } catch {}
+  }
+  try { return JSON.parse(text); } catch { return { raw: text }; }
+}
+
+async function nlmRpc(method, params = {}, id = Date.now()) {
+  const headers = { ...NLM_HEADERS };
+  if (nlmSessionId) headers["mcp-session-id"] = nlmSessionId;
+  const r = await fetch(NLM_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+    signal: AbortSignal.timeout(60000),
+  });
+  const sid = r.headers.get("mcp-session-id");
+  if (sid) nlmSessionId = sid;
+  return parseNlmResponse(await r.text());
+}
+
+async function nlmInit() {
+  if (nlmSessionId) return;
+  await nlmRpc("initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "lark-proxy", version: "1.0" },
+  });
+  // fire-and-forget notification
+  const headers = { ...NLM_HEADERS };
+  if (nlmSessionId) headers["mcp-session-id"] = nlmSessionId;
+  fetch(NLM_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => {});
+}
+
+async function nlmTool(tool, toolInput) {
+  await nlmInit();
+  const resp = await nlmRpc("tools/call", { name: tool, arguments: toolInput });
+  const raw = resp?.result?.content?.[0]?.text ?? resp?.result ?? resp;
+  if (typeof raw === "string") {
+    try { return JSON.parse(raw); } catch { return raw; }
+  }
+  return raw;
+}
+
+// POST /notebooklm/query — ask a question (optionally with inline sources)
+app.post("/notebooklm/query", async (req, res) => {
+  const { question, notebook_id, sources = [], session_id } = req.body || {};
+  if (!question) return res.status(400).json({ error: "question required" });
+
+  try {
+    let notebookId = notebook_id;
+
+    // If no notebook_id, pick first available notebook
+    if (!notebookId) {
+      const notebooks = await nlmTool("list_notebooks", {});
+      const raw = notebooks?.data?.notebooks || notebooks?.notebooks || notebooks;
+      const list = Array.isArray(raw) ? raw : [];
+      if (list.length === 0) {
+        return res.status(400).json({
+          error: "NotebookLM 还没有注册笔记本。请先用 notebooklm_add_notebook 工具注册一个 NotebookLM 分享链接，再进行查询。",
+          setup_required: true,
+        });
+      }
+      notebookId = list[0].id;
+    }
+
+    // Add inline text sources before asking
+    for (const src of sources) {
+      const addArgs = { source_type: "text", content: String(src) };
+      if (notebookId) addArgs.notebook_id = notebookId;
+      await nlmTool("add_source", addArgs);
+    }
+
+    // Ask the question
+    const askArgs = { question };
+    if (notebookId) askArgs.notebook_id = notebookId;
+    if (session_id)  askArgs.session_id  = session_id;
+
+    const answer = await nlmTool("ask_question", askArgs);
+    res.json({ ok: true, answer, notebook_id: notebookId });
+  } catch (err) {
+    console.error("[notebooklm/query error]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /notebooklm/notebooks — list all notebooks
+app.get("/notebooklm/notebooks", async (_req, res) => {
+  try {
+    const result = await nlmTool("list_notebooks", {});
+    res.json({ ok: true, notebooks: Array.isArray(result) ? result : (result?.notebooks || result) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /notebooklm/add_notebook — register a NotebookLM share URL
+app.post("/notebooklm/add_notebook", async (req, res) => {
+  const { url, name, description } = req.body || {};
+  if (!url) return res.status(400).json({ error: "url required (NotebookLM share URL)" });
+  try {
+    const args = { url };
+    if (name)        args.name        = name;
+    if (description) args.description = description;
+    const result = await nlmTool("add_notebook", args);
+    res.json({ ok: true, result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /notebooklm/health — server health + auth status
+app.get("/notebooklm/health", async (_req, res) => {
+  try {
+    const result = await nlmTool("get_health", {});
+    res.json({ ok: true, health: result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /notebooklm/add_source — add a source to a notebook
+app.post("/notebooklm/add_source", async (req, res) => {
+  const { notebook_id, source_type = "text", content, url } = req.body || {};
+  try {
+    const args = { source_type };
+    if (notebook_id) args.notebook_id = notebook_id;
+    if (content) args.content = content;
+    if (url)     args.url     = url;
+    const result = await nlmTool("add_source", args);
+    res.json({ ok: true, result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 7788;
 app.listen(PORT, () => {
   console.log(`✅ 代理服务启动：http://localhost:${PORT}`);
-  console.log(`   支持：lark-cli (POST /exec)  dreamina (POST /dreamina)  热榜 (POST /hot-topics)`);
+  console.log(`   支持：lark-cli (POST /exec)  dreamina (POST /dreamina)  热榜 (POST /hot-topics)  notebooklm (POST /notebooklm/query)`);
   console.log(`   Secret: ${SECRET}`);
 });

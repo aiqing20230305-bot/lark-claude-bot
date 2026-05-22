@@ -392,6 +392,50 @@ async function webpageExec(url, maxChars = 8000) {
   }
 }
 
+async function notebooklmAddNotebookExec(url, name, description) {
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (!proxyUrl) return { error: "未配置 LARK_PROXY_URL，请先启动本地代理" };
+  try {
+    const res = await fetch(`${proxyUrl}/notebooklm/add_notebook`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026",
+      },
+      body: JSON.stringify({ url, name, description }),
+      signal: AbortSignal.timeout(30000),
+    });
+    return await res.json();
+  } catch (err) {
+    return { error: `添加笔记本失败: ${err.message}` };
+  }
+}
+
+async function notebooklmQueryExec(question, sources = [], notebookId, sessionId) {
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (!proxyUrl) return { error: "未配置 LARK_PROXY_URL，请先启动本地代理" };
+
+  try {
+    const body = { question };
+    if (notebookId) body.notebook_id = notebookId;
+    if (sessionId)  body.session_id  = sessionId;
+    if (sources?.length) body.sources = sources;
+
+    const res = await fetch(`${proxyUrl}/notebooklm/query`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026",
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(90000),
+    });
+    return await res.json();
+  } catch (err) {
+    return { error: `NotebookLM 查询失败: ${err.message}` };
+  }
+}
+
 // Tool implementations
 async function getCalendarEvents(startTime, endTime) {
   // Get primary calendar ID first
@@ -1556,6 +1600,63 @@ const tools = [
       required: ["url"],
     },
   },
+  {
+    name: "notebooklm_add_notebook",
+    description: `注册一个 NotebookLM 笔记本，让后续的 notebooklm_query 能对其提问。
+用法：用户提供 NotebookLM 分享链接（https://notebooklm.google.com/notebook/xxx），调用此工具注册。
+注册后，notebooklm_query 会自动使用已注册的笔记本。`,
+    input_schema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "NotebookLM 笔记本分享链接，格式：https://notebooklm.google.com/notebook/xxx",
+        },
+        name: {
+          type: "string",
+          description: "笔记本的名称（可选，便于识别）",
+        },
+        description: {
+          type: "string",
+          description: "笔记本用途说明（可选）",
+        },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "notebooklm_query",
+    description: `用 Google NotebookLM 对资料进行深度研究并生成高质量报告/摘要/分析。
+适用场景：
+- 生成报告、研究摘要、深度分析
+- 对多份资料进行综合提炼
+- 生成带有引用来源的专业内容
+- 用户要求"做报告"、"深度分析"、"综合分析"时优先使用
+工作原理：将问题和可选的资料源提交给 NotebookLM（Gemini 2.5 驱动），基于已有知识库或提供的源材料作答。`,
+    input_schema: {
+      type: "object",
+      properties: {
+        question: {
+          type: "string",
+          description: "向 NotebookLM 提出的问题或报告指令，如：'请综合以下资料，生成一份关于XXX的深度分析报告'",
+        },
+        sources: {
+          type: "array",
+          items: { type: "string" },
+          description: "可选。要注入 NotebookLM 的文本资料（如搜索结果、网页内容、用户提供的文字）。每项为一段文本。",
+        },
+        notebook_id: {
+          type: "string",
+          description: "可选。指定 NotebookLM 笔记本 ID；不填时自动使用第一个可用笔记本。",
+        },
+        session_id: {
+          type: "string",
+          description: "可选。对话 session ID，用于多轮追问时保持上下文。",
+        },
+      },
+      required: ["question"],
+    },
+  },
 ];
 
 // Execute a tool call
@@ -1663,6 +1764,10 @@ async function executeTool(name, input, ctx = {}) {
       return JSON.stringify(await searchExec(input.query, input.limit));
     case "fetch_webpage":
       return JSON.stringify(await webpageExec(input.url, input.max_chars));
+    case "notebooklm_add_notebook":
+      return JSON.stringify(await notebooklmAddNotebookExec(input.url, input.name, input.description));
+    case "notebooklm_query":
+      return JSON.stringify(await notebooklmQueryExec(input.question, input.sources, input.notebook_id, input.session_id));
     default:
       return `未知工具: ${name}`;
   }
@@ -1806,6 +1911,8 @@ function toolProgressMsg(name, input) {
   if (name === "run_dreamina")             return "🎨 正在生成图像/视频...";
   if (name === "web_search")               return `🔍 正在搜索：${input?.query}`;
   if (name === "fetch_webpage")            return `🌐 正在读取网页：${input?.url?.slice(0, 60)}...`;
+  if (name === "notebooklm_add_notebook")  return `📔 正在注册 NotebookLM 笔记本...`;
+  if (name === "notebooklm_query")         return `📚 正在用 NotebookLM 深度研究...`;
   if (name === "generate_creative_content") {
     const type = input?.media_type === "video" ? "视频" : "图片";
     const engine = input?.engine === "dreamina" ? "Dreamina" : "GPT-Image";
@@ -1985,7 +2092,22 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
 
 【单纯读页面】用户直接分享 URL → 跳过搜索，直接 fetch_webpage
 
-**第六优先级：其他工具**
+**第六优先级：notebooklm_query（深度报告与研究）**
+
+【触发条件】——遇到以下情况使用 NotebookLM：
+- 用户要求生成"报告"、"深度分析"、"综合分析"、"研究报告"
+- 需要对多份资料进行综合提炼和归纳
+- 需要高质量、有引用的专业输出
+
+【标准工作流（推荐）】
+1. 先用 web_search + fetch_webpage 收集相关资料
+2. 把收集到的文字作为 sources 传入 notebooklm_query
+3. question 写清报告要求，如"请基于以下资料生成一份500字的深度分析报告"
+4. 将 NotebookLM 的回答作为报告主体，整理后回复用户
+
+【纯知识问答】不需要搜索时，直接以 question 调用 notebooklm_query 即可
+
+**第七优先级：其他工具**
 - 只在 run_lark_cli 返回错误或代理不可用时，才使用其他工具
 
 ## 其他规则
