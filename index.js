@@ -1403,22 +1403,57 @@ const tools = [
     },
   },
   {
-    name: "generate_image",
-    description: "用 OpenAI gpt-image-1 根据文字描述生成图片，并自动发送到飞书对话。适合用户说「画一张…」「生成图片…」「帮我做个图…」等需求。",
+    name: "generate_creative_content",
+    description: `生成图片或视频创意内容。
+⚠️ 调用前必须已向用户收集完整的「创意需求简报」，绝不允许在未追问的情况下直接生成。
+
+引擎选择规则：
+- 写实/精细/照片感图片 → engine: "gpt-image-1"
+- 艺术感/动漫/插画/水墨/概念艺术图片 → engine: "dreamina"
+- 任何视频需求 → engine: "dreamina"（自动选 text2video 或 image2video）
+- 不确定 → engine: "auto"`,
     input_schema: {
       type: "object",
       properties: {
-        prompt: {
+        media_type: {
           type: "string",
-          description: "图片描述，建议使用详细英文描述以获得最佳效果，例如 'a cute orange cat sitting on a wooden desk, soft lighting, photorealistic'",
+          enum: ["image", "video", "image_sequence"],
+          description: "image（单张图片）/ video（视频）/ image_sequence（多张系列图）",
         },
-        size: {
+        prompt_en: {
           type: "string",
-          enum: ["1024x1024", "1024x1536", "1536x1024"],
-          description: "图片尺寸：1024x1024（正方形）、1024x1536（竖版）、1536x1024（横版），默认正方形",
+          description: "英文生成提示词，详细描述画面内容、风格、光线、构图等，用于实际生成",
+        },
+        style: {
+          type: "string",
+          enum: ["realistic", "illustration", "3d", "anime", "minimalist", "painting", "cinematic", "other"],
+          description: "风格：realistic写实 / illustration插画 / 3d三维 / anime动漫 / minimalist极简 / painting油画水彩 / cinematic电影感",
+        },
+        aspect_ratio: {
+          type: "string",
+          enum: ["1:1", "16:9", "9:16", "4:3", "3:4"],
+          description: "宽高比：1:1方图 / 16:9横版 / 9:16竖版海报 / 4:3 / 3:4",
+        },
+        engine: {
+          type: "string",
+          enum: ["auto", "gpt-image-1", "dreamina"],
+          description: "生成引擎：auto自动选择 / gpt-image-1写实细节强 / dreamina艺术风格强",
+        },
+        count: {
+          type: "number",
+          description: "生成数量，默认1，image_sequence 时可设置2-4",
+        },
+        reference_image_url: {
+          type: "string",
+          description: "参考图 URL，图生视频或风格参考时使用",
+        },
+        video_duration: {
+          type: "number",
+          enum: [5, 10],
+          description: "视频时长（秒），仅 video 类型有效，默认5",
         },
       },
-      required: ["prompt"],
+      required: ["media_type", "prompt_en", "style", "aspect_ratio", "engine"],
     },
   },
 ];
@@ -1522,6 +1557,8 @@ async function executeTool(name, input, ctx = {}) {
       return JSON.stringify(await getApprovalInstanceDetail(input.instance_code));
     case "generate_image":
       return JSON.stringify(await generateImageExec(input.prompt, input.size, ctx.msgId));
+    case "generate_creative_content":
+      return JSON.stringify(await generateCreativeContent(input, ctx));
     default:
       return `未知工具: ${name}`;
   }
@@ -1662,8 +1699,89 @@ function toolProgressMsg(name, input) {
   }
   if (name === "get_hot_topics") return "🔥 正在获取国内热榜...";
   if (name === "run_atypica")    return "📡 正在查询全球趋势...";
-  if (name === "run_dreamina")   return "🎨 正在生成图像/视频...";
+  if (name === "run_dreamina")             return "🎨 正在生成图像/视频...";
+  if (name === "generate_creative_content") {
+    const type = input?.media_type === "video" ? "视频" : "图片";
+    const engine = input?.engine === "dreamina" ? "Dreamina" : "GPT-Image";
+    return `🎨 正在用 ${engine} 生成${type}...`;
+  }
   return null;
+}
+
+// ── Creative Content Generation — brief-driven router ────────────────────────
+const DREAMINA_RATIO_MAP = { "1:1": "1:1", "16:9": "16:9", "9:16": "9:16", "4:3": "4:3", "3:4": "3:4" };
+const GPT_SIZE_MAP       = { "1:1": "1024x1024", "16:9": "1536x1024", "9:16": "1024x1536", "4:3": "1536x1024", "3:4": "1024x1536" };
+
+async function generateCreativeContent(brief, ctx = {}) {
+  const {
+    media_type, prompt_en, style,
+    aspect_ratio = "1:1",
+    engine = "auto",
+    count = 1,
+    reference_image_url,
+    video_duration = 5,
+  } = brief;
+
+  // Auto-select engine
+  let actualEngine = engine;
+  if (engine === "auto") {
+    if (media_type === "video") {
+      actualEngine = "dreamina";
+    } else if (["anime", "illustration", "painting"].includes(style)) {
+      actualEngine = "dreamina";
+    } else {
+      actualEngine = "gpt-image-1";
+    }
+  }
+
+  // ── VIDEO ──────────────────────────────────────────────────────────────────
+  if (media_type === "video") {
+    const ratio = DREAMINA_RATIO_MAP[aspect_ratio] || "16:9";
+    const args = reference_image_url
+      ? ["image2video", "--image_url", reference_image_url, "--prompt", prompt_en, "--duration", String(video_duration)]
+      : ["text2video", "--prompt", prompt_en, "--duration", String(video_duration)];
+
+    const submitResult = await dreaminaExec(args);
+    const sd = typeof submitResult.output === "object" ? submitResult.output : {};
+    const submitId = sd?.data?.submit_id;
+    if (!submitId) return { error: "视频任务提交失败", detail: sd };
+
+    // Poll up to 3 min (18 × 10s)
+    for (let i = 0; i < 18; i++) {
+      await new Promise((r) => setTimeout(r, 10000));
+      const qr = await dreaminaExec(["query_result", "--submit_id", submitId]);
+      const qd = typeof qr.output === "object" ? qr.output : {};
+      if (qd?.data?.status === "success") {
+        return { success: true, type: "video", submit_id: submitId, result: qd.data };
+      }
+      if (qd?.data?.status === "failed") {
+        return { error: "视频生成失败", detail: qd.data };
+      }
+    }
+    return { error: "视频生成超时，可稍后用 query_result 查询 submit_id=" + submitId };
+  }
+
+  // ── IMAGE via Dreamina ─────────────────────────────────────────────────────
+  if (actualEngine === "dreamina") {
+    const ratio = DREAMINA_RATIO_MAP[aspect_ratio] || "1:1";
+    const results = [];
+    const n = Math.min(Math.max(count || 1, 1), 4);
+    for (let i = 0; i < n; i++) {
+      const r = await dreaminaExec(["text2image", "--prompt", prompt_en, "--ratio", ratio, "--resolution_type", "2k"]);
+      results.push(r);
+    }
+    return { success: true, engine: "dreamina", count: n, results };
+  }
+
+  // ── IMAGE via gpt-image-1 (Codex) ─────────────────────────────────────────
+  const size = GPT_SIZE_MAP[aspect_ratio] || "1024x1024";
+  const n = Math.min(Math.max(count || 1, 1), 4);
+  const results = [];
+  for (let i = 0; i < n; i++) {
+    const r = await generateImageExec(prompt_en, size, ctx.msgId);
+    results.push(r);
+  }
+  return { success: true, engine: "gpt-image-1", count: n, results };
 }
 
 // Claude Agent loop
@@ -1673,8 +1791,21 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
   if (!chatHistory.has(chatId)) chatHistory.set(chatId, []);
   const history = chatHistory.get(chatId);
 
-  history.push({ role: "user", content: userContent });
+  // History stores text only — images/audio stored as placeholder to keep context small
+  const historyContent = Array.isArray(userContent)
+    ? (userContent.find(b => b.type === "text")?.text || "[媒体消息]")
+    : userContent;
+  history.push({ role: "user", content: historyContent });
+
+  // Keep last 20 turns; always start with a user message after trimming
   if (history.length > 20) history.splice(0, history.length - 20);
+  while (history.length > 0 && history[0].role !== "user") history.shift();
+
+  // messages uses full content for current turn (e.g. actual image blocks)
+  const messages = [
+    ...history.slice(0, -1),
+    { role: "user", content: userContent },
+  ];
 
   const systemPrompt = `你是「经纬」，一个智能飞书助手，可以操作飞书的所有功能。
 
@@ -1699,10 +1830,34 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
 - 用户问全球热点、英文趋势、海外话题时使用（locale 仅支持 en-US）
 - 示例：args=["pulse","list","--limit","10","--order-by","heatScore"]
 
-**第四优先级：generate_image（AI 绘图）**
-- 用户说「画一张」「生成图片」「帮我做个图」「设计一张」时使用
-- prompt 尽量用详细英文描述，size 默认 1024x1024（横版用 1536x1024，竖版用 1024x1536）
-- 工具会直接把图片发送到飞书，成功后返回 image_key，告知用户已生成即可
+**第四优先级：generate_creative_content（AI 创意生成）**
+
+⚠️ 铁律：检测到创意生成需求后，**先追问，后生成**，禁止直接调工具。
+
+【触发词】：画一张、帮我做个图、生成图片、设计一张、做个视频、生成视频、帮我拍个、做张海报……
+
+【第一步 — 追问简报（2-3个最关键的问题）】
+
+  图片需求追问：
+  - 用途/平台：社交媒体配图 / 广告素材 / 个人收藏 / 品牌物料
+  - 风格：写实照片感 / 插画漫画 / 3D渲染 / 极简设计 / 动漫 / 油画水彩
+  - 比例方向：方图(1:1) / 横版(16:9) / 竖版海报(9:16)
+  - 可选追问：氛围色调、参考品牌/艺术家风格
+
+  视频需求追问：
+  - 时长：5秒 / 10秒
+  - 素材来源：从零文字生成 / 让某张已有图片动起来
+  - 风格节奏：轻快广告感 / 舒缓写意 / 震撼动感
+
+【第二步 — 收齐后生成】
+  整合用户回答，把中文需求翻译成详细的英文 prompt，再调用 generate_creative_content。
+
+  引擎选择：
+  - 写实/照片感/精细细节 → engine: "gpt-image-1"
+  - 插画/动漫/水墨/艺术概念 → engine: "dreamina"
+  - 视频 → engine: "dreamina"（自动选 text2video 或 image2video）
+
+  图片生成成功后直接告知用户；视频生成需轮询，完成后告知下载链接或结果。
 
 **第五优先级：其他工具**
 - 只在 run_lark_cli 返回错误或代理不可用时，才使用其他工具
@@ -1713,7 +1868,6 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
 3. 如果所有工具都失败，告知用户具体错误
 4. 今天的日期是 ${new Date().toLocaleDateString("zh-CN")}`;
 
-  let messages = [...history];
   let finalReply = "";
   let toolCallCount = 0;
 
