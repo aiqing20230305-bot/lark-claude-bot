@@ -2106,11 +2106,29 @@ app.post("/webhook", async (req, res) => {
       if (!userContent) return;
     } else if (message.message_type === "post") {
       const lang = content.zh_cn || content.en_us || Object.values(content)[0];
-      userContent = lang?.content?.flat()
-        .filter(e => e.tag === "text")
-        .map(e => e.text)
-        .join("").trim() || "";
-      if (!userContent) return;
+      const blocks = (lang?.content || []).flat();
+      const textContent = blocks.filter(e => e.tag === "text").map(e => e.text).join("").trim();
+      const imgKeys = blocks.filter(e => e.tag === "img" && e.image_key).map(e => e.image_key);
+
+      if (imgKeys.length === 0) {
+        // 纯文字 post
+        userContent = textContent;
+        if (!userContent) return;
+      } else {
+        // 包含图片的 post — 构建多模态内容
+        const parts = [];
+        if (textContent) parts.push({ type: "text", text: textContent });
+        for (const key of imgKeys) {
+          try {
+            const buf = await downloadResource(message.message_id, key, "image");
+            parts.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: buf.toString("base64") } });
+          } catch (err) {
+            console.error("[post-img] 嵌套图片下载失败:", err.message);
+          }
+        }
+        if (parts.length === 0) return;
+        userContent = parts;
+      }
     } else if (message.message_type === "image") {
       userContent = await processImageMessage(message);
     } else if (message.message_type === "audio") {
