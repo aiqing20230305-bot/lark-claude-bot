@@ -337,6 +337,26 @@ async function hotTopicsExec(platform = "all", limit = 20) {
   }
 }
 
+async function searchExec(query, limit = 8) {
+  const proxyUrl = process.env.LARK_PROXY_URL;
+  if (!proxyUrl) return { error: "未配置 LARK_PROXY_URL，请先启动本地代理" };
+
+  try {
+    const res = await fetch(`${proxyUrl}/search`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026",
+      },
+      body: JSON.stringify({ query, limit }),
+      signal: AbortSignal.timeout(15000),
+    });
+    return await res.json();
+  } catch (err) {
+    return { error: `搜索失败: ${err.message}` };
+  }
+}
+
 async function webpageExec(url, maxChars = 8000) {
   const proxyUrl = process.env.LARK_PROXY_URL;
   if (!proxyUrl) return { error: "未配置 LARK_PROXY_URL，请先启动本地代理" };
@@ -1477,6 +1497,29 @@ const tools = [
     },
   },
   {
+    name: "web_search",
+    description: `在互联网上搜索实时信息，返回标题、摘要和 URL 列表。
+适用场景：
+- 问题涉及最新动态、当前价格、近期新闻、实时数据
+- 需要验证某个事实的当前状态
+- 用户问「最新的…」「现在…」「今天…」「X 是多少」等实时性问题
+搜索后可用 fetch_webpage 读取最相关的页面获取完整内容。`,
+    input_schema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "搜索关键词，建议用精确的关键词组合，英文关键词搜英文资料效果更好",
+        },
+        limit: {
+          type: "number",
+          description: "返回结果数量，默认 8，最多 15",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
     name: "fetch_webpage",
     description: `抓取任意网页的文本内容，用于：
 - 用户分享一个 URL 让你分析/总结
@@ -1601,6 +1644,8 @@ async function executeTool(name, input, ctx = {}) {
       return JSON.stringify(await generateImageExec(input.prompt, input.size, ctx.msgId));
     case "generate_creative_content":
       return JSON.stringify(await generateCreativeContent(input, ctx));
+    case "web_search":
+      return JSON.stringify(await searchExec(input.query, input.limit));
     case "fetch_webpage":
       return JSON.stringify(await webpageExec(input.url, input.max_chars));
     default:
@@ -1744,6 +1789,7 @@ function toolProgressMsg(name, input) {
   if (name === "get_hot_topics") return "🔥 正在获取国内热榜...";
   if (name === "run_atypica")    return "📡 正在查询全球趋势...";
   if (name === "run_dreamina")             return "🎨 正在生成图像/视频...";
+  if (name === "web_search")               return `🔍 正在搜索：${input?.query}`;
   if (name === "fetch_webpage")            return `🌐 正在读取网页：${input?.url?.slice(0, 60)}...`;
   if (name === "generate_creative_content") {
     const type = input?.media_type === "video" ? "视频" : "图片";
@@ -1904,10 +1950,20 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
 
   图片生成成功后直接告知用户；视频生成需轮询，完成后告知下载链接或结果。
 
-**第五优先级：fetch_webpage（读取网页）**
-- 用户分享 URL 或说「帮我看看这个网页/文章」时使用
-- 抓取后用中文总结关键信息，超长内容只总结重点
-- 不支持需要登录的页面；微信公众号/知乎等可能有反爬
+**第五优先级：web_search + fetch_webpage（互联网搜索与阅读）**
+
+【主动搜索触发条件】——遇到以下情况必须先搜索再回答，不能凭记忆：
+- 涉及「最新」「现在」「今天」「当前」「最近」的问题
+- 问价格、汇率、股价、天气、赛事结果等实时数据
+- 问某事件/产品/公司的最新进展
+- 你自己对某个事实不确定，知识截止日期后可能已有变化
+
+【标准工作流】
+1. 先调 web_search(query) 得到标题+摘要+URL 列表
+2. 选 1-3 个最相关的 URL，用 fetch_webpage 读取全文
+3. 整合信息，用中文回答用户，注明信息来源
+
+【单纯读页面】用户直接分享 URL → 跳过搜索，直接 fetch_webpage
 
 **第六优先级：其他工具**
 - 只在 run_lark_cli 返回错误或代理不可用时，才使用其他工具

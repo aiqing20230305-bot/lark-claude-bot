@@ -29,7 +29,7 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => res.json({
   ok: true,
   time: new Date().toISOString(),
-  services: ["lark-cli", "dreamina", "atypica", "extract-audio", "transcribe", "hot-topics", "generate-image", "fetch-url"],
+  services: ["lark-cli", "dreamina", "atypica", "extract-audio", "transcribe", "hot-topics", "generate-image", "fetch-url", "search"],
 }));
 
 function runCmd(bin, args, timeoutMs = 30000) {
@@ -193,6 +193,66 @@ app.post("/transcribe", (req, res) => {
   } finally {
     try { fs.unlinkSync(tmpRaw); } catch {}
     try { fs.unlinkSync(tmpMp3); } catch {}
+  }
+});
+
+// ── 网页搜索（Bing China，无需 API key，中国直连可用） ─────────────────────────
+const SEARCH_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+function parseBingResults(html, limit) {
+  const results = [];
+  // Each organic result is inside <li class="b_algo">
+  const blockRe = /<li[^>]+class="[^"]*b_algo[^"]*"[^>]*>([\s\S]*?)<\/li>/g;
+  let m;
+  while ((m = blockRe.exec(html)) !== null && results.length < limit) {
+    const block = m[1];
+    // Title + URL from <h2><a href="...">Title</a></h2>
+    const titleM = block.match(/<h2[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
+    if (!titleM) continue;
+    const url = titleM[1];
+    const title = titleM[2].replace(/<[^>]+>/g, "").replace(/&[a-z#0-9]+;/gi, " ").trim();
+    if (!title || !url.startsWith("http")) continue;
+
+    // Snippet from <p> or <div class="b_caption">
+    const snipM = block.match(/<p[^>]*>([\s\S]*?)<\/p>/) ||
+                  block.match(/<div[^>]+class="[^"]*b_caption[^"]*"[^>]*>([\s\S]*?)<\/div>/);
+    const snippet = snipM
+      ? snipM[1].replace(/<[^>]+>/g, "").replace(/&[a-z#0-9]+;/gi, " ").trim().slice(0, 200)
+      : "";
+
+    results.push({ title, url, snippet });
+  }
+  return results;
+}
+
+app.post("/search", async (req, res) => {
+  const { query, limit = 8 } = req.body;
+  if (!query) return res.status(400).json({ error: "query required" });
+
+  const encoded = encodeURIComponent(query);
+  const searchUrl = `https://cn.bing.com/search?q=${encoded}&setlang=zh-Hans&count=20`;
+
+  try {
+    const r = await fetch(searchUrl, {
+      headers: {
+        "User-Agent": SEARCH_UA,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) return res.status(502).json({ error: `Bing 返回 HTTP ${r.status}` });
+
+    const html = await r.text();
+    const results = parseBingResults(html, Math.min(limit, 15));
+
+    if (results.length === 0) {
+      return res.json({ query, results: [], note: "未解析到结果，可能页面结构已变" });
+    }
+    res.json({ query, results });
+  } catch (err) {
+    console.error("[search error]", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
