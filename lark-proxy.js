@@ -648,6 +648,108 @@ app.post("/notebooklm/add_source", async (req, res) => {
   }
 });
 
+// ── 飞书多维表格对话历史（全量存储，bot 自动建表）───────────────────────────────
+const HISTORY_CONFIG_FILE = path.join(os.homedir(), ".claude", "lark-history-config.json");
+let _historyConfig = null;
+
+async function ensureHistoryTable() {
+  if (_historyConfig) return _historyConfig;
+  if (fs.existsSync(HISTORY_CONFIG_FILE)) {
+    _historyConfig = JSON.parse(fs.readFileSync(HISTORY_CONFIG_FILE, "utf8"));
+    return _historyConfig;
+  }
+
+  // 首次运行：自动创建 Bitable 应用
+  const appRes = runCmd(LARK_CLI, [
+    "api", "POST", "/open-apis/bitable/v1/apps",
+    "--as", "bot",
+    "--data", JSON.stringify({ name: "经纬对话历史" }),
+  ], 15000);
+  const appToken = appRes.output?.data?.app?.app_token;
+  if (!appToken) throw new Error(`创建 Bitable 失败: ${JSON.stringify(appRes)}`);
+
+  // 建表（四个字段：chat_id / role / content / timestamp）
+  const tableRes = runCmd(LARK_CLI, [
+    "api", "POST", `/open-apis/bitable/v1/apps/${appToken}/tables`,
+    "--as", "bot",
+    "--data", JSON.stringify({
+      table: {
+        name: "对话记录",
+        fields: [
+          { field_name: "chat_id",   type: 1 },
+          { field_name: "role",      type: 1 },
+          { field_name: "content",   type: 1 },
+          { field_name: "timestamp", type: 1 },
+        ],
+      },
+    }),
+  ], 15000);
+  const tableId = tableRes.output?.data?.table_id;
+  if (!tableId) throw new Error(`创建表格失败: ${JSON.stringify(tableRes)}`);
+
+  _historyConfig = { appToken, tableId };
+  fs.writeFileSync(HISTORY_CONFIG_FILE, JSON.stringify(_historyConfig, null, 2));
+  console.log(`[history] 已创建对话历史表格 appToken=${appToken} tableId=${tableId}`);
+  return _historyConfig;
+}
+
+// 读取某个 chat 的历史（最近 N 条）
+app.get("/history/:chatId", async (req, res) => {
+  try {
+    const { appToken, tableId } = await ensureHistoryTable();
+    const limit = Math.min(parseInt(req.query.limit) || 30, 50);
+    const result = runCmd(LARK_CLI, [
+      "api", "GET",
+      `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records`,
+      "--params", JSON.stringify({
+        filter: `CurrentValue.[chat_id]="${req.params.chatId}"`,
+        page_size: 50,
+      }),
+      "--as", "bot",
+    ], 15000);
+    const items = result.output?.data?.items || [];
+    const messages = items
+      .sort((a, b) => Number(a.fields.timestamp || 0) - Number(b.fields.timestamp || 0))
+      .slice(-limit)
+      .map(r => ({ role: r.fields.role, content: r.fields.content || "" }));
+    res.json({ messages });
+  } catch (err) {
+    console.error("[history/get]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 追加对话轮次 { chatId, turns: [{role, content}] }
+app.post("/history/append", async (req, res) => {
+  const { chatId, turns } = req.body || {};
+  if (!chatId || !Array.isArray(turns) || turns.length === 0) {
+    return res.status(400).json({ error: "chatId and turns required" });
+  }
+  try {
+    const { appToken, tableId } = await ensureHistoryTable();
+    const now = Date.now();
+    for (let i = 0; i < turns.length; i++) {
+      runCmd(LARK_CLI, [
+        "api", "POST",
+        `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records`,
+        "--as", "bot",
+        "--data", JSON.stringify({
+          fields: {
+            chat_id:   chatId,
+            role:      turns[i].role,
+            content:   (turns[i].content || "").slice(0, 3000),
+            timestamp: String(now + i),
+          },
+        }),
+      ], 10000);
+    }
+    res.json({ ok: true, count: turns.length });
+  } catch (err) {
+    console.error("[history/append]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── 持久记忆存储（为 Railway bot 提供跨部署的对话记忆）────────────────────────
 const MEMORY_DIR = path.join(os.homedir(), ".claude", "lark-bot-memory");
 fs.mkdirSync(MEMORY_DIR, { recursive: true });

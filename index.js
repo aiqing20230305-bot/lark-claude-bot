@@ -1778,6 +1778,8 @@ const chatHistory = new Map();
 const processedMsgIds = new Set();
 // 记录 messageId → chat_type，供 reaction handler 判断群聊/p2p
 const msgChatTypeCache = new Map();
+// 已从 Feishu Bitable 加载过历史的 chatId（每次 Railway 启动后首次对话时加载一次）
+const historyLoaded = new Set();
 
 // ── 启动恢复：处理 Railway 重启期间遗漏的消息 ────────────────────────────────
 // 只在代理注册后调用，确保 runAgent 可以正常调用飞书 API
@@ -2006,6 +2008,29 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
   if (!chatHistory.has(chatId)) chatHistory.set(chatId, []);
   const history = chatHistory.get(chatId);
 
+  // ── 首次对话：从 Feishu Bitable 加载全量历史 ──────────────────────────────────
+  if (!historyLoaded.has(chatId) && process.env.LARK_PROXY_URL) {
+    historyLoaded.add(chatId);
+    try {
+      const _hr = await fetch(
+        `${process.env.LARK_PROXY_URL}/history/${chatId}?limit=30`,
+        {
+          headers: { "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026" },
+          signal: AbortSignal.timeout(5000),
+        }
+      );
+      if (_hr.ok) {
+        const { messages: stored } = await _hr.json();
+        if (Array.isArray(stored) && stored.length > 0) {
+          chatHistory.set(chatId, stored);
+          console.log(`[history] 从 Bitable 加载 ${stored.length} 条历史 chat=${chatId.slice(-8)}`);
+        }
+      }
+    } catch (err) {
+      console.warn("[history] 加载失败:", err.message);
+    }
+  }
+
   // History stores text only — images/audio stored as placeholder to keep context small
   const historyContent = Array.isArray(userContent)
     ? (userContent.find(b => b.type === "text")?.text || "[媒体消息]")
@@ -2183,7 +2208,32 @@ ${memorySection}
 
   history.push({ role: "assistant", content: finalReply });
 
-  // ── 每 5 轮自动更新持久记忆 ────────────────────────────────────────────────────
+  // ── 异步写入 Feishu Bitable（不阻塞回复）────────────────────────────────────────
+  if (_proxyUrl && finalReply) {
+    (async () => {
+      try {
+        await fetch(`${_proxyUrl}/history/append`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026",
+          },
+          body: JSON.stringify({
+            chatId,
+            turns: [
+              { role: "user",      content: typeof historyContent === "string" ? historyContent : "[媒体消息]" },
+              { role: "assistant", content: finalReply },
+            ],
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+      } catch (err) {
+        console.warn("[history/append]", err.message);
+      }
+    })();
+  }
+
+  // ── 每 3 轮自动更新持久记忆摘要 ───────────────────────────────────────────────
   const newTurnCount = (persistentMemory.turnCount || 0) + 1;
   if (_proxyUrl && newTurnCount % 3 === 0 && finalReply) {
     (async () => {
