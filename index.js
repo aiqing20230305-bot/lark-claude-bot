@@ -1659,13 +1659,76 @@ const tools = [
   },
 ];
 
+// ── 隐私安全 guard：检查外发操作是否需要用户二次确认 ─────────────────────────
+// 返回 true = 已确认可继续，返回 false = 已拦截（调用方应返回 requires_confirmation）
+function _checkOutboundConfirm(ctx, target, preview) {
+  const { chatId } = ctx;
+  const key = `${chatId}:${target}`;
+  if (confirmedOps.has(key)) {
+    confirmedOps.delete(key);
+    return true;
+  }
+  // 存入 pending，5 分钟有效
+  pendingConfirmations.set(chatId, {
+    target,
+    preview,
+    expires: Date.now() + 5 * 60 * 1000,
+  });
+  return false;
+}
+
 // Execute a tool call
 async function executeTool(name, input, ctx = {}) {
   switch (name) {
     case "run_dreamina":
       return JSON.stringify(await dreaminaExec(input.args));
-    case "run_lark_cli":
-      return JSON.stringify(await larkProxyExec(input.args));
+    case "run_lark_cli": {
+      const args = [...(input.args || [])];
+      // 检查是否是 IM 写操作（POST/PUT 到 /im/v1/messages 或 /messages/*/forward）
+      const method = (args[1] || "").toUpperCase();
+      const apiPath = args[2] || "";
+      const isImWrite =
+        ["POST", "PUT"].includes(method) &&
+        (apiPath.includes("/im/v1/messages") || apiPath.includes("/messages"));
+      if (isImWrite) {
+        // 提取 receive_id（目标 chat_id 或 open_id）
+        let targetId = null;
+        const dataIdx = args.indexOf("--data");
+        if (dataIdx !== -1) {
+          try {
+            const data = JSON.parse(args[dataIdx + 1]);
+            targetId = data.receive_id || data.chat_id || null;
+          } catch {}
+        }
+        // 提取消息内容预览
+        let msgPreview = "(消息内容)";
+        const dataIdx2 = args.indexOf("--data");
+        if (dataIdx2 !== -1) {
+          try {
+            const data = JSON.parse(args[dataIdx2 + 1]);
+            const raw = data.content || "";
+            try {
+              msgPreview = JSON.parse(raw)?.text || raw;
+            } catch {
+              msgPreview = raw;
+            }
+          } catch {}
+        }
+        // 若目标与当前 chatId 不同（跨会话外发），触发确认机制
+        if (targetId && targetId !== ctx.chatId) {
+          if (!_checkOutboundConfirm(ctx, targetId, msgPreview)) {
+            return JSON.stringify({
+              requires_confirmation: true,
+              target: targetId,
+              preview: msgPreview,
+              instruction:
+                "⚠️ 隐私保护：请先向用户展示以上消息内容和目标，等待用户明确回复「确认发送」后再重新调用此工具。在用户确认之前不要执行发送。",
+            });
+          }
+        }
+      }
+      return JSON.stringify(await larkProxyExec(args));
+    }
     case "run_atypica":
       return JSON.stringify(await atypicaExec(input.args));
     case "get_hot_topics":
@@ -1680,12 +1743,36 @@ async function executeTool(name, input, ctx = {}) {
       return JSON.stringify(await searchDocs(input.query));
     case "get_chats":
       return JSON.stringify(await getChats());
-    case "send_message":
+    case "send_message": {
+      // 发送到非当前会话的群，需二次确认
+      if (input.chat_id && input.chat_id !== ctx.chatId) {
+        if (!_checkOutboundConfirm(ctx, input.chat_id, input.text)) {
+          return JSON.stringify({
+            requires_confirmation: true,
+            target: input.chat_id,
+            preview: input.text,
+            instruction:
+              "⚠️ 隐私保护：请先向用户展示以上消息内容和目标群，等待用户明确回复「确认发送」后再重新调用此工具。",
+          });
+        }
+      }
       return await sendMessage(input.chat_id, input.text);
+    }
     case "get_messages":
       return JSON.stringify(await getMessages(input.chat_id, input.page_size));
-    case "send_direct_message":
+    case "send_direct_message": {
+      // 私信始终需要二次确认
+      if (!_checkOutboundConfirm(ctx, input.open_id || "dm", input.text)) {
+        return JSON.stringify({
+          requires_confirmation: true,
+          target: input.open_id,
+          preview: input.text,
+          instruction:
+            "⚠️ 隐私保护：请先向用户展示收件人和消息内容，等待用户明确回复「确认发送」后再重新调用此工具。",
+        });
+      }
       return await sendDirectMessage(input.open_id, input.text);
+    }
     case "create_calendar_event":
       return JSON.stringify(await createCalendarEvent(input.summary, input.start_timestamp, input.end_timestamp, input.description, input.location));
     case "update_calendar_event":
@@ -1712,8 +1799,21 @@ async function executeTool(name, input, ctx = {}) {
       return await pinMessage(input.chat_id, input.message_id);
     case "add_reaction":
       return await addReaction(input.message_id, input.reaction_type);
-    case "forward_message":
+    case "forward_message": {
+      // 转发到非当前会话，需二次确认
+      if (input.chat_id && input.chat_id !== ctx.chatId) {
+        if (!_checkOutboundConfirm(ctx, input.chat_id, `转发消息 ${input.message_id}`)) {
+          return JSON.stringify({
+            requires_confirmation: true,
+            target: input.chat_id,
+            preview: `转发消息 ID: ${input.message_id}`,
+            instruction:
+              "⚠️ 隐私保护：请先向用户确认转发目标，等待用户明确回复「确认发送」后再重新调用此工具。",
+          });
+        }
+      }
       return await forwardMessage(input.message_id, input.chat_id);
+    }
     case "create_group":
       return JSON.stringify(await createGroup(input.name, input.open_ids || []));
     case "add_group_member":
@@ -1780,6 +1880,14 @@ const processedMsgIds = new Set();
 const msgChatTypeCache = new Map();
 // 已从 Feishu Bitable 加载过历史的 chatId（每次 Railway 启动后首次对话时加载一次）
 const historyLoaded = new Set();
+
+// ── 隐私安全确认机制 ──────────────────────────────────────────────────────────
+// pendingConfirmations: chatId → { tool, target, preview, expires }
+//   存储待确认的外发操作，等用户二次确认
+const pendingConfirmations = new Map();
+// confirmedOps: Set of "chatId:target" keys
+//   用户确认后写入，executeTool 消费后删除（一次性通行证）
+const confirmedOps = new Set();
 
 // ── 启动恢复：处理 Railway 重启期间遗漏的消息 ────────────────────────────────
 // 只在代理注册后调用，确保 runAgent 可以正常调用飞书 API
@@ -2005,6 +2113,27 @@ async function generateCreativeContent(brief, ctx = {}) {
 // userContent: string (text) or array of Claude content blocks (multi-modal)
 // onProgress: optional async (msg: string) => void，每步工具调用前回调
 async function runAgent(chatId, userContent, onProgress, msgId = null) {
+  // ── 隐私安全：检测用户是否在确认一条待发送操作 ────────────────────────────────
+  if (pendingConfirmations.has(chatId)) {
+    const pending = pendingConfirmations.get(chatId);
+    if (Date.now() < pending.expires) {
+      const msgText =
+        typeof userContent === "string"
+          ? userContent
+          : Array.isArray(userContent)
+          ? (userContent.find(b => b.type === "text")?.text || "")
+          : "";
+      if (/^[\s]*[确認]认[发發]?送|^[\s]*(发送|确认|是的|好的|yes|confirm|ok)/i.test(msgText.trim())) {
+        // 用户确认，写入一次性通行证
+        confirmedOps.add(`${chatId}:${pending.target}`);
+        pendingConfirmations.delete(chatId);
+        console.log(`[privacy] 用户确认发送 target=${pending.target}`);
+      }
+    } else {
+      pendingConfirmations.delete(chatId);
+    }
+  }
+
   if (!chatHistory.has(chatId)) chatHistory.set(chatId, []);
   const history = chatHistory.get(chatId);
 
@@ -2153,6 +2282,27 @@ ${memorySection}
 
 **第七优先级：其他工具**
 - 只在 run_lark_cli 返回错误或代理不可用时，才使用其他工具
+
+## 🔒 隐私安全规则（最高优先级，不可违反）
+
+**在向任何群聊、私人用户发送消息前，必须先征得用户的二次确认。**
+
+具体规则：
+1. **发群消息**（send_message / run_lark_cli 向非当前会话的 chat_id 发消息）：
+   - 先向用户展示完整的消息内容、目标群名
+   - 明确询问「是否确认发送？」
+   - 用户明确说「确认」「发送」「是的」等肯定词后，才执行工具调用
+
+2. **发私人消息**（send_direct_message / run_lark_cli 向 open_id 发消息）：
+   - 先展示收件人、消息内容
+   - 明确询问「是否确认发送给 [姓名]？」
+   - 用户明确确认后才执行
+
+3. **使用用户账号（--as user）发送任何消息**：严格禁止，--as user 只能用于 GET 读取
+
+4. **转发消息**（forward_message）：同样需要用户确认目标群/人后才执行
+
+⚠️ 违反此规则视为严重错误。宁可多问一次，不可擅自发送。
 
 ## 其他规则
 1. 使用工具获取实时数据，不要凭记忆回答
