@@ -1776,6 +1776,8 @@ async function executeTool(name, input, ctx = {}) {
 // Multi-turn conversation history per chat
 const chatHistory = new Map();
 const processedMsgIds = new Set();
+// 记录 messageId → chat_type，供 reaction handler 判断群聊/p2p
+const msgChatTypeCache = new Map();
 
 // ── 启动恢复：处理 Railway 重启期间遗漏的消息 ────────────────────────────────
 // 只在代理注册后调用，确保 runAgent 可以正常调用飞书 API
@@ -2355,8 +2357,10 @@ app.post("/webhook", async (req, res) => {
     if (eventType === "im.message.reaction.created_v1") {
       const emoji = event.reaction_type?.emoji_type || "";
       const reactionMsgId = event.message_id;
-      // 只响应用户（非 bot 自己）的表情
+      // 只响应用户（非 bot 自己）的表情；群聊里不自动回复表情
       if (!reactionMsgId || event.operator_type !== "user") return;
+      const reactionChatType = msgChatTypeCache.get(reactionMsgId);
+      if (reactionChatType && reactionChatType !== "p2p") return;
 
       const REACTION_REPLIES = {
         THUMBSUP:   "嗯！",
@@ -2398,6 +2402,11 @@ app.post("/webhook", async (req, res) => {
     processedMsgIds.add(msgId);
     if (processedMsgIds.size > 1000) {
       processedMsgIds.delete(processedMsgIds.values().next().value);
+    }
+    // 记录 chat_type 供 reaction handler 判断
+    msgChatTypeCache.set(msgId, message.chat_type);
+    if (msgChatTypeCache.size > 2000) {
+      msgChatTypeCache.delete(msgChatTypeCache.keys().next().value);
     }
 
     const SUPPORTED = ["text", "post", "image", "audio", "media"];
