@@ -1977,6 +1977,9 @@ const msgChatTypeCache = new Map();
 // 已从 Feishu Bitable 加载过历史的 chatId（每次 Railway 启动后首次对话时加载一次）
 const historyLoaded = new Set();
 
+// session 级别对话轮次计数（Railway 重启后清零，但只需 3 轮即可触发首次记忆保存）
+const sessionTurnCounts = new Map();
+
 // ── 隐私安全确认机制 ──────────────────────────────────────────────────────────
 // pendingConfirmations: chatId → { tool, target, preview, expires }
 //   存储待确认的外发操作，等用户二次确认
@@ -2498,8 +2501,11 @@ ${memorySection}
   }
 
   // ── 每 3 轮自动更新持久记忆摘要 ───────────────────────────────────────────────
+  // 用 session 计数触发（避免首次无记忆时 Bitable turnCount=0 导致永远不保存的 bug）
+  const sessionTurn = (sessionTurnCounts.get(chatId) || 0) + 1;
+  sessionTurnCounts.set(chatId, sessionTurn);
   const newTurnCount = (persistentMemory.turnCount || 0) + 1;
-  if (_proxyUrl && newTurnCount % 3 === 0 && finalReply) {
+  if (_proxyUrl && sessionTurn % 3 === 0 && finalReply) {
     (async () => {
       try {
         const memResp = await anthropic.messages.create({
