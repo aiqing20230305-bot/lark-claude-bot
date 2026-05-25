@@ -556,6 +556,50 @@ async function sendDirectMessage(openId, text) {
   return data.code === 0 ? "消息发送成功" : `发送失败: ${data.msg}`;
 }
 
+// ── 飞书卡片 ──────────────────────────────────────────────────────────────────
+function buildCard({ title, content, options, headerColor = "blue" }) {
+  // options: [{ label, value?, type? }]  type: "primary"|"danger"|"default"
+  const actions = options.map((opt, i) => ({
+    tag: "button",
+    text: { tag: "plain_text", content: opt.label },
+    type: opt.type || (i === 0 ? "primary" : "default"),
+    value: { key: opt.value ?? opt.label, label: opt.label },
+  }));
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: "plain_text", content: title },
+      template: headerColor,
+    },
+    elements: [
+      { tag: "div", text: { tag: "lark_md", content: content } },
+      { tag: "action", actions },
+    ],
+  };
+}
+
+async function sendCard(chatId, { title, content, options, headerColor = "blue" }) {
+  const card = buildCard({ title, content, options, headerColor });
+  const data = await botApiCall("/open-apis/im/v1/messages?receive_id_type=chat_id", "POST", {
+    receive_id: chatId,
+    msg_type: "interactive",
+    content: JSON.stringify(card),
+  });
+  if (data.code === 0) {
+    return { ok: true, message_id: data.data?.message_id };
+  }
+  return { ok: false, error: data.msg };
+}
+
+async function updateCard(messageId, { title, content, options, headerColor }) {
+  const card = buildCard({ title, content, options, headerColor });
+  const data = await botApiCall(`/open-apis/im/v1/messages/${messageId}`, "PATCH", {
+    msg_type: "interactive",
+    content: JSON.stringify(card),
+  });
+  return data.code === 0 ? { ok: true } : { ok: false, error: data.msg };
+}
+
 async function getPrimaryCalendarId() {
   const cals = await userApiCall("/open-apis/calendar/v4/calendars?page_size=10");
   if (cals.data?.calendar_list) {
@@ -1070,6 +1114,37 @@ const tools = [
         text: { type: "string", description: "消息内容" },
       },
       required: ["chat_id", "text"],
+    },
+  },
+  {
+    name: "send_card",
+    description: "向飞书聊天发送交互式卡片（带按钮选项）。适用于：需要用户做选择、需要用户确认操作、多步骤引导。比纯文字选项体验更好。",
+    input_schema: {
+      type: "object",
+      properties: {
+        chat_id: { type: "string", description: "目标 chat_id，当前对话填 ctx.chatId" },
+        title: { type: "string", description: "卡片标题，简短" },
+        content: { type: "string", description: "卡片正文，支持 markdown" },
+        options: {
+          type: "array",
+          description: "按钮选项列表，建议 2-4 个",
+          items: {
+            type: "object",
+            properties: {
+              label: { type: "string", description: "按钮显示文字" },
+              value: { type: "string", description: "按钮触发的值（可选，默认等于 label）" },
+              type: { type: "string", enum: ["primary", "default", "danger"], description: "按钮样式" },
+            },
+            required: ["label"],
+          },
+        },
+        header_color: {
+          type: "string",
+          enum: ["blue", "wathet", "turquoise", "green", "yellow", "orange", "red", "carmine", "violet", "purple", "indigo", "grey"],
+          description: "卡片头部颜色，默认 blue",
+        },
+      },
+      required: ["chat_id", "title", "content", "options"],
     },
   },
   {
@@ -1722,7 +1797,7 @@ async function executeTool(name, input, ctx = {}) {
               target: targetId,
               preview: msgPreview,
               instruction:
-                "⚠️ 隐私保护：请先向用户展示以上消息内容和目标，等待用户明确回复「确认发送」后再重新调用此工具。在用户确认之前不要执行发送。",
+                "⚠️ 隐私保护：请立即调用 send_card 向用户展示消息预览，卡片包含「确认发送」（primary）和「取消」（default）两个按钮，等用户点击确认后再重新调用此工具。",
             });
           }
         }
@@ -1752,11 +1827,32 @@ async function executeTool(name, input, ctx = {}) {
             target: input.chat_id,
             preview: input.text,
             instruction:
-              "⚠️ 隐私保护：请先向用户展示以上消息内容和目标群，等待用户明确回复「确认发送」后再重新调用此工具。",
+              "⚠️ 隐私保护：请调用 send_card 向用户展示消息预览和目标群，卡片选项设「确认发送」和「取消」，等用户点击后再重新调用此工具。",
           });
         }
       }
       return await sendMessage(input.chat_id, input.text);
+    }
+    case "send_card": {
+      // 发送到当前会话时，默认使用 ctx.chatId
+      const cardChatId = input.chat_id === "ctx.chatId" ? ctx.chatId : (input.chat_id || ctx.chatId);
+      // 跨会话卡片也需要隐私确认
+      if (cardChatId && cardChatId !== ctx.chatId) {
+        if (!_checkOutboundConfirm(ctx, cardChatId, `[卡片] ${input.title}`)) {
+          return JSON.stringify({
+            requires_confirmation: true,
+            target: cardChatId,
+            preview: `卡片：${input.title}`,
+            instruction: "⚠️ 向其他聊天发送卡片需要用户确认。",
+          });
+        }
+      }
+      return JSON.stringify(await sendCard(cardChatId, {
+        title: input.title,
+        content: input.content,
+        options: input.options,
+        headerColor: input.header_color,
+      }));
     }
     case "get_messages":
       return JSON.stringify(await getMessages(input.chat_id, input.page_size));
@@ -1768,7 +1864,7 @@ async function executeTool(name, input, ctx = {}) {
           target: input.open_id,
           preview: input.text,
           instruction:
-            "⚠️ 隐私保护：请先向用户展示收件人和消息内容，等待用户明确回复「确认发送」后再重新调用此工具。",
+            "⚠️ 隐私保护：请调用 send_card 展示收件人和消息预览，卡片选项设「确认发送」和「取消」，等用户点击后再重新调用此工具。",
         });
       }
       return await sendDirectMessage(input.open_id, input.text);
@@ -1808,7 +1904,7 @@ async function executeTool(name, input, ctx = {}) {
             target: input.chat_id,
             preview: `转发消息 ID: ${input.message_id}`,
             instruction:
-              "⚠️ 隐私保护：请先向用户确认转发目标，等待用户明确回复「确认发送」后再重新调用此工具。",
+              "⚠️ 隐私保护：请调用 send_card 展示转发目标，卡片选项设「确认转发」和「取消」，等用户点击后再重新调用此工具。",
           });
         }
       }
@@ -2123,7 +2219,7 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
           : Array.isArray(userContent)
           ? (userContent.find(b => b.type === "text")?.text || "")
           : "";
-      if (/^[\s]*[确認]认[发發]?送|^[\s]*(发送|确认|是的|好的|yes|confirm|ok)/i.test(msgText.trim())) {
+      if (/[确認]认[发發]?送|[确認]认转发|^[\s]*(发送|确认|是的|好的|yes|confirm|ok)/i.test(msgText.trim())) {
         // 用户确认，写入一次性通行证
         confirmedOps.add(`${chatId}:${pending.target}`);
         pendingConfirmations.delete(chatId);
@@ -2282,6 +2378,24 @@ ${memorySection}
 
 **第七优先级：其他工具**
 - 只在 run_lark_cli 返回错误或代理不可用时，才使用其他工具
+
+## 🃏 卡片交互规则
+
+**优先使用 send_card（而非纯文字选项）的场景：**
+1. 需要用户做选择（2-4个选项）→ 用按钮卡片，不要发「请回复1/2/3」
+2. 需要用户确认危险/外发操作 → 卡片含「确认」(primary) + 「取消」(default) 按钮
+3. 多步骤引导的每一步 → 每步发一张卡片引导下一步
+
+**send_card 参数说明：**
+- chat_id：填当前对话的 ID（发送给当前用户）
+- title：简短标题，如「选择平台」「确认发送」
+- content：markdown 正文，可展示预览内容
+- options：按钮列表，建议 2-4 个，第一个用 "primary" 样式
+- header_color：默认 "blue"；确认类用 "orange"；危险操作用 "red"
+
+**卡片按钮点击后：**
+- 系统会自动注入「[用户点击了卡片按钮]「xxx」」到对话
+- Claude 根据点击内容继续执行对应操作
 
 ## 🔒 隐私安全规则（最高优先级，不可违反）
 
@@ -2518,6 +2632,32 @@ app.post("/webhook", async (req, res) => {
 
   if (body.type === "url_verification") {
     return res.json({ challenge: body.challenge });
+  }
+
+  // ── 飞书卡片按钮回调（同步响应，必须在 res.json 前处理）─────────────────────
+  if (body.action && body.open_chat_id) {
+    const chatId   = body.open_chat_id;
+    const actionVal = body.action.value || {};
+    const label    = actionVal.label || actionVal.key || "已选择";
+    const key      = actionVal.key   || label;
+
+    console.log(`[card] 按钮点击 chat=${chatId.slice(-8)} key=${key} label=${label}`);
+
+    // 先回复 toast，让卡片 UI 立即响应
+    res.json({ toast: { type: "success", content: `已选择：${label}` } });
+
+    // 异步注入选择结果到对话，用 sendMessage 发回（无 messageId 可 reply）
+    setImmediate(async () => {
+      try {
+        const injectedText = `[用户点击了卡片按钮]「${label}」`;
+        const reply = await runAgent(chatId, injectedText, null, null);
+        if (reply) await sendMessage(chatId, reply);
+      } catch (err) {
+        console.error("[card] 回调处理失败:", err.message);
+        await sendMessage(chatId, `⚠️ 处理卡片选择时出错：${err.message.slice(0, 100)}`).catch(() => {});
+      }
+    });
+    return;
   }
 
   res.json({ code: 0 });
