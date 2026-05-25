@@ -648,50 +648,93 @@ app.post("/notebooklm/add_source", async (req, res) => {
   }
 });
 
-// ── 飞书多维表格对话历史（全量存储，bot 自动建表）───────────────────────────────
+// ── 飞书多维表格：对话历史 + 用户记忆（统一存储，bot 自动建表）─────────────────
 const HISTORY_CONFIG_FILE = path.join(os.homedir(), ".claude", "lark-history-config.json");
 let _historyConfig = null;
 
 async function ensureHistoryTable() {
-  if (_historyConfig) return _historyConfig;
+  // 已完整初始化
+  if (_historyConfig?.memoryTableId) return _historyConfig;
+
+  // 读取已有配置
   if (fs.existsSync(HISTORY_CONFIG_FILE)) {
     _historyConfig = JSON.parse(fs.readFileSync(HISTORY_CONFIG_FILE, "utf8"));
-    return _historyConfig;
   }
 
-  // 首次运行：自动创建 Bitable 应用
-  const appRes = runCmd(LARK_CLI, [
-    "api", "POST", "/open-apis/bitable/v1/apps",
-    "--as", "bot",
-    "--data", JSON.stringify({ name: "经纬对话历史" }),
-  ], 15000);
-  const appToken = appRes.output?.data?.app?.app_token;
-  if (!appToken) throw new Error(`创建 Bitable 失败: ${JSON.stringify(appRes)}`);
+  const needApp    = !_historyConfig?.appToken;
+  const needConvTb = !_historyConfig?.tableId;
+  const needMemTb  = !_historyConfig?.memoryTableId;
 
-  // 建表（四个字段：chat_id / role / content / timestamp）
-  const tableRes = runCmd(LARK_CLI, [
-    "api", "POST", `/open-apis/bitable/v1/apps/${appToken}/tables`,
-    "--as", "bot",
-    "--data", JSON.stringify({
-      table: {
-        name: "对话记录",
-        fields: [
-          { field_name: "chat_id",   type: 1 },
-          { field_name: "role",      type: 1 },
-          { field_name: "content",   type: 1 },
-          { field_name: "timestamp", type: 1 },
-        ],
-      },
-    }),
-  ], 15000);
-  const tableId = tableRes.output?.data?.table_id;
-  if (!tableId) throw new Error(`创建表格失败: ${JSON.stringify(tableRes)}`);
+  if (!needApp && !needConvTb && !needMemTb) return _historyConfig;
 
-  _historyConfig = { appToken, tableId };
+  let appToken = _historyConfig?.appToken;
+
+  // 创建 Bitable 应用（首次）
+  if (needApp) {
+    const appRes = runCmd(LARK_CLI, [
+      "api", "POST", "/open-apis/bitable/v1/apps",
+      "--as", "bot",
+      "--data", JSON.stringify({ name: "经纬记忆库" }),
+    ], 15000);
+    appToken = appRes.output?.data?.app?.app_token;
+    if (!appToken) throw new Error(`创建 Bitable 失败: ${JSON.stringify(appRes)}`);
+    console.log(`[memory] 已创建 Bitable 应用 appToken=${appToken}`);
+  }
+
+  // 创建「对话记录」表
+  let tableId = _historyConfig?.tableId;
+  if (needConvTb) {
+    const r = runCmd(LARK_CLI, [
+      "api", "POST", `/open-apis/bitable/v1/apps/${appToken}/tables`,
+      "--as", "bot",
+      "--data", JSON.stringify({
+        table: {
+          name: "对话记录",
+          fields: [
+            { field_name: "chat_id",   type: 1 },
+            { field_name: "role",      type: 1 },
+            { field_name: "content",   type: 1 },
+            { field_name: "timestamp", type: 1 },
+          ],
+        },
+      }),
+    ], 15000);
+    tableId = r.output?.data?.table_id;
+    if (!tableId) throw new Error(`创建对话记录表失败: ${JSON.stringify(r)}`);
+    console.log(`[memory] 已创建对话记录表 tableId=${tableId}`);
+  }
+
+  // 创建「用户记忆」表
+  let memoryTableId = _historyConfig?.memoryTableId;
+  if (needMemTb) {
+    const r = runCmd(LARK_CLI, [
+      "api", "POST", `/open-apis/bitable/v1/apps/${appToken}/tables`,
+      "--as", "bot",
+      "--data", JSON.stringify({
+        table: {
+          name: "用户记忆",
+          fields: [
+            { field_name: "chat_id",      type: 1 },
+            { field_name: "summary",      type: 1 },
+            { field_name: "key_facts",    type: 1 },
+            { field_name: "turn_count",   type: 1 },
+            { field_name: "last_updated", type: 1 },
+          ],
+        },
+      }),
+    ], 15000);
+    memoryTableId = r.output?.data?.table_id;
+    if (!memoryTableId) throw new Error(`创建用户记忆表失败: ${JSON.stringify(r)}`);
+    console.log(`[memory] 已创建用户记忆表 memoryTableId=${memoryTableId}`);
+  }
+
+  _historyConfig = { appToken, tableId, memoryTableId };
   fs.writeFileSync(HISTORY_CONFIG_FILE, JSON.stringify(_historyConfig, null, 2));
-  console.log(`[history] 已创建对话历史表格 appToken=${appToken} tableId=${tableId}`);
   return _historyConfig;
 }
+
+// 初始化（proxy 启动时后台执行，不阻塞请求）
+ensureHistoryTable().catch(err => console.error("[memory] 初始化失败:", err.message));
 
 // 读取某个 chat 的历史（最近 N 条）
 app.get("/history/:chatId", async (req, res) => {
@@ -750,26 +793,85 @@ app.post("/history/append", async (req, res) => {
   }
 });
 
-// ── 持久记忆存储（为 Railway bot 提供跨部署的对话记忆）────────────────────────
-const MEMORY_DIR = path.join(os.homedir(), ".claude", "lark-bot-memory");
-fs.mkdirSync(MEMORY_DIR, { recursive: true });
+// ── 用户记忆：存入飞书「用户记忆」表，本地 10 分钟缓存 ─────────────────────────
+const _memCache = new Map(); // chatId → { data, expiresAt }
+const MEM_TTL   = 10 * 60 * 1000;
 
-app.get("/memory/:chatId", (req, res) => {
-  const file = path.join(MEMORY_DIR, `${req.params.chatId}.json`);
-  if (!fs.existsSync(file)) return res.json({ summary: "", keyFacts: [], turnCount: 0 });
+async function fetchMemory(chatId) {
+  const hit = _memCache.get(chatId);
+  if (hit && Date.now() < hit.expiresAt) return hit.data;
+
+  const { appToken, memoryTableId } = await ensureHistoryTable();
+  const r = runCmd(LARK_CLI, [
+    "api", "GET",
+    `/open-apis/bitable/v1/apps/${appToken}/tables/${memoryTableId}/records`,
+    "--params", JSON.stringify({ filter: `CurrentValue.[chat_id]="${chatId}"`, page_size: 1 }),
+    "--as", "bot",
+  ], 10000);
+
+  const item = (r.output?.data?.items || [])[0];
+  const data = item
+    ? {
+        summary:     item.fields.summary      || "",
+        keyFacts:    JSON.parse(item.fields.key_facts || "[]"),
+        turnCount:   parseInt(item.fields.turn_count)  || 0,
+        lastUpdated: item.fields.last_updated || "",
+        _recordId:   item.record_id,
+      }
+    : { summary: "", keyFacts: [], turnCount: 0, _recordId: null };
+
+  _memCache.set(chatId, { data, expiresAt: Date.now() + MEM_TTL });
+  return data;
+}
+
+app.get("/memory/:chatId", async (req, res) => {
   try {
-    res.json(JSON.parse(fs.readFileSync(file, "utf8")));
-  } catch {
+    const data = await fetchMemory(req.params.chatId);
+    res.json(data);
+  } catch (err) {
+    console.error("[memory/get]", err.message);
     res.json({ summary: "", keyFacts: [], turnCount: 0 });
   }
 });
 
-app.post("/memory/:chatId", (req, res) => {
-  const file = path.join(MEMORY_DIR, `${req.params.chatId}.json`);
+app.post("/memory/:chatId", async (req, res) => {
+  const chatId = req.params.chatId;
+  const { summary = "", keyFacts = [], turnCount = 0 } = req.body || {};
   try {
-    fs.writeFileSync(file, JSON.stringify({ ...req.body, lastUpdated: new Date().toISOString() }, null, 2));
+    const { appToken, memoryTableId } = await ensureHistoryTable();
+    const existing = await fetchMemory(chatId);
+    const fields = {
+      chat_id:      chatId,
+      summary,
+      key_facts:    JSON.stringify(keyFacts),
+      turn_count:   String(turnCount),
+      last_updated: new Date().toISOString(),
+    };
+
+    if (existing._recordId) {
+      runCmd(LARK_CLI, [
+        "api", "PUT",
+        `/open-apis/bitable/v1/apps/${appToken}/tables/${memoryTableId}/records/${existing._recordId}`,
+        "--as", "bot",
+        "--data", JSON.stringify({ fields }),
+      ], 10000);
+    } else {
+      runCmd(LARK_CLI, [
+        "api", "POST",
+        `/open-apis/bitable/v1/apps/${appToken}/tables/${memoryTableId}/records`,
+        "--as", "bot",
+        "--data", JSON.stringify({ fields }),
+      ], 10000);
+    }
+
+    // 更新缓存
+    _memCache.set(chatId, {
+      data: { summary, keyFacts, turnCount, lastUpdated: fields.last_updated, _recordId: existing._recordId },
+      expiresAt: Date.now() + MEM_TTL,
+    });
     res.json({ ok: true });
   } catch (err) {
+    console.error("[memory/post]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
