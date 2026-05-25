@@ -2020,7 +2020,24 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
     { role: "user", content: userContent },
   ];
 
+  // ── 加载持久记忆（proxy 侧 JSON 文件，Railway 重启后依然存在）──────────────────
+  let persistentMemory = { summary: "", keyFacts: [], turnCount: 0 };
+  const _proxyUrl = process.env.LARK_PROXY_URL;
+  if (_proxyUrl) {
+    try {
+      const _mr = await fetch(`${_proxyUrl}/memory/${chatId}`, {
+        headers: { "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026" },
+        signal: AbortSignal.timeout(3000),
+      });
+      if (_mr.ok) persistentMemory = await _mr.json();
+    } catch {}
+  }
+  const memorySection = persistentMemory.summary
+    ? `## 关于这位用户的记忆\n${persistentMemory.summary}\n关键事实：${(persistentMemory.keyFacts || []).join("、") || "无"}\n\n`
+    : "";
+
   const systemPrompt = `你是「经纬」，一个智能飞书助手，可以操作飞书的所有功能。
+${memorySection}
 
 ## 工具使用规则（严格遵守）
 
@@ -2163,6 +2180,41 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
   }
 
   history.push({ role: "assistant", content: finalReply });
+
+  // ── 每 5 轮自动更新持久记忆 ────────────────────────────────────────────────────
+  const newTurnCount = (persistentMemory.turnCount || 0) + 1;
+  if (_proxyUrl && newTurnCount % 5 === 0 && finalReply) {
+    (async () => {
+      try {
+        const memResp = await anthropic.messages.create({
+          model: "pa/claude-sonnet-4-6",
+          max_tokens: 300,
+          messages: [
+            ...messages,
+            { role: "assistant", content: finalReply },
+            { role: "user", content: '请用1-2句话总结这位用户的身份和近期关注点，再列出2-4条关键事实（偏好、习惯、项目等）。只输出JSON，格式：{"summary":"...","keyFacts":["...","..."]}' },
+          ],
+        });
+        const raw = memResp.content[0]?.text || "";
+        const parsed = JSON.parse(raw.match(/\{[\s\S]+\}/)?.[0] || "{}");
+        if (parsed.summary) {
+          await fetch(`${_proxyUrl}/memory/${chatId}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-proxy-secret": process.env.LARK_PROXY_SECRET || "lark-proxy-secret-2026",
+            },
+            body: JSON.stringify({ ...parsed, turnCount: newTurnCount, chatId }),
+            signal: AbortSignal.timeout(5000),
+          });
+          console.log(`[memory] 已更新 chatId=${chatId.slice(-8)} turnCount=${newTurnCount}`);
+        }
+      } catch (err) {
+        console.warn("[memory] 记忆更新失败:", err.message);
+      }
+    })();
+  }
+
   return finalReply;
 }
 

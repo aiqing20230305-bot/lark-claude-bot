@@ -648,9 +648,33 @@ app.post("/notebooklm/add_source", async (req, res) => {
   }
 });
 
+// ── 持久记忆存储（为 Railway bot 提供跨部署的对话记忆）────────────────────────
+const MEMORY_DIR = path.join(os.homedir(), ".claude", "lark-bot-memory");
+fs.mkdirSync(MEMORY_DIR, { recursive: true });
+
+app.get("/memory/:chatId", (req, res) => {
+  const file = path.join(MEMORY_DIR, `${req.params.chatId}.json`);
+  if (!fs.existsSync(file)) return res.json({ summary: "", keyFacts: [], turnCount: 0 });
+  try {
+    res.json(JSON.parse(fs.readFileSync(file, "utf8")));
+  } catch {
+    res.json({ summary: "", keyFacts: [], turnCount: 0 });
+  }
+});
+
+app.post("/memory/:chatId", (req, res) => {
+  const file = path.join(MEMORY_DIR, `${req.params.chatId}.json`);
+  try {
+    fs.writeFileSync(file, JSON.stringify({ ...req.body, lastUpdated: new Date().toISOString() }, null, 2));
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 7788;
 app.listen(PORT, () => {
   console.log(`✅ 代理服务启动：http://localhost:${PORT}`);
-  console.log(`   支持：lark-cli (POST /exec)  dreamina (POST /dreamina)  热榜 (POST /hot-topics)  notebooklm (POST /notebooklm/query)`);
+  console.log(`   支持：lark-cli (POST /exec)  dreamina (POST /dreamina)  热榜 (POST /hot-topics)  notebooklm (POST /notebooklm/query)  记忆 (GET|POST /memory/:chatId)`);
   console.log(`   Secret: ${SECRET}`);
 });
