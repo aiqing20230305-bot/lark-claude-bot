@@ -2033,8 +2033,8 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
     } catch {}
   }
   const memorySection = persistentMemory.summary
-    ? `## 关于这位用户的记忆\n${persistentMemory.summary}\n关键事实：${(persistentMemory.keyFacts || []).join("、") || "无"}\n\n`
-    : "";
+    ? `## 关于这位用户的记忆（持久存储，跨对话有效）\n${persistentMemory.summary}\n关键事实：${(persistentMemory.keyFacts || []).join("、") || "无"}\n\n`
+    : `## 记忆系统\n你拥有持久化记忆能力。当前这位用户尚无历史记忆（首次对话或记忆待建立）。每隔几轮对话你会自动提炼并保存记忆，下次对话时会自动加载。\n\n`;
 
   const systemPrompt = `你是「经纬」，一个智能飞书助手，可以操作飞书的所有功能。
 ${memorySection}
@@ -2183,7 +2183,7 @@ ${memorySection}
 
   // ── 每 5 轮自动更新持久记忆 ────────────────────────────────────────────────────
   const newTurnCount = (persistentMemory.turnCount || 0) + 1;
-  if (_proxyUrl && newTurnCount % 5 === 0 && finalReply) {
+  if (_proxyUrl && newTurnCount % 3 === 0 && finalReply) {
     (async () => {
       try {
         const memResp = await anthropic.messages.create({
