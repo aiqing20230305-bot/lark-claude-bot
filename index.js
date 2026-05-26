@@ -2406,19 +2406,13 @@ ${memorySection}
 
 ### 确认流程（必须严格遵守）：
 
-当 send_message / send_direct_message / forward_message / send_card（跨会话）工具返回：
-```json
-{"requires_confirmation": true, "target": "...", "preview": "...", "instruction": "..."}
-```
+当 send_message / send_direct_message / forward_message / send_card（跨会话）工具返回 {"requires_confirmation": true, "target": "...", "preview": "...", "instruction": "..."} 时：
 
 **你必须立即**：
-1. 调用 `send_card` 向**当前会话**（chat_id = 当前用户的 chatId）发送确认卡片
-2. 卡片格式：
-   - title: "确认发送"（header_color: "orange"）
-   - content: 展示目标收件人、消息内容预览
-   - options: [{"label": "确认发送", "type": "primary"}, {"label": "取消", "type": "default"}]
+1. 调用 send_card 向**当前会话**（chat_id = 当前用户的 chatId）发送确认卡片
+2. 卡片格式：title="确认发送"（header_color: "orange"），content 展示目标收件人和消息预览，options 含「确认发送」(primary) 和「取消」(default) 两个按钮
 3. **不得**自行解释为"权限不足"或"无法发送"——这只是等待用户确认，不是报错
-4. 用户点击「确认发送」后，系统会注入「[用户点击了卡片按钮]「确认发送」」，你再重新调用原工具
+4. 用户点击确认后，系统会注入「[用户点击了卡片按钮]「确认发送」」，你再重新调用原工具
 
 **其他规则：**
 - **使用用户账号（--as user）发送任何消息**：严格禁止，--as user 只能用于 GET 读取
