@@ -2213,6 +2213,7 @@ async function generateCreativeContent(brief, ctx = {}) {
 // onProgress: optional async (msg: string) => void，每步工具调用前回调
 async function runAgent(chatId, userContent, onProgress, msgId = null) {
   // ── 隐私安全：检测用户是否在确认一条待发送操作 ────────────────────────────────
+  let isConfirmTurn = false;
   if (pendingConfirmations.has(chatId)) {
     const pending = pendingConfirmations.get(chatId);
     if (Date.now() < pending.expires) {
@@ -2226,6 +2227,7 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
         // 用户确认，写入一次性通行证
         confirmedOps.add(`${chatId}:${pending.target}`);
         pendingConfirmations.delete(chatId);
+        isConfirmTurn = true;
         console.log(`[privacy] 用户确认发送 target=${pending.target}`);
       }
     } else {
@@ -2270,9 +2272,13 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
   while (history.length > 0 && history[0].role !== "user") history.shift();
 
   // messages uses full content for current turn (e.g. actual image blocks)
+  // If this is a text confirmation turn, inject a note so Claude knows to proceed directly
+  const currentUserContent = isConfirmTurn && typeof userContent === "string"
+    ? `${userContent}\n\n[系统提示：用户已明确确认，请立即重新调用被拦截的发送工具（send_direct_message / send_message / forward_message），直接执行，不要再展示确认卡片或再次询问。]`
+    : userContent;
   const messages = [
     ...history.slice(0, -1),
-    { role: "user", content: userContent },
+    { role: "user", content: currentUserContent },
   ];
 
   // ── 加载持久记忆（proxy 侧 JSON 文件，Railway 重启后依然存在）──────────────────
