@@ -1736,18 +1736,20 @@ const tools = [
 
 // ── 隐私安全 guard：检查外发操作是否需要用户二次确认 ─────────────────────────
 // 返回 true = 已确认可继续，返回 false = 已拦截（调用方应返回 requires_confirmation）
-function _checkOutboundConfirm(ctx, target, preview) {
+function _checkOutboundConfirm(ctx, target, preview, toolName = null, toolInput = null) {
   const { chatId } = ctx;
   const key = `${chatId}:${target}`;
   if (confirmedOps.has(key)) {
     confirmedOps.delete(key);
     return true;
   }
-  // 存入 pending，5 分钟有效
+  // 存入 pending，5 分钟有效，同时记录工具调用参数供确认后回放
   pendingConfirmations.set(chatId, {
     target,
     preview,
     expires: Date.now() + 5 * 60 * 1000,
+    toolName,
+    toolInput,
   });
   return false;
 }
@@ -1791,7 +1793,7 @@ async function executeTool(name, input, ctx = {}) {
         }
         // 若目标与当前 chatId 不同（跨会话外发），触发确认机制
         if (targetId && targetId !== ctx.chatId) {
-          if (!_checkOutboundConfirm(ctx, targetId, msgPreview)) {
+          if (!_checkOutboundConfirm(ctx, targetId, msgPreview, "run_lark_cli", input)) {
             return JSON.stringify({
               requires_confirmation: true,
               target: targetId,
@@ -1821,7 +1823,7 @@ async function executeTool(name, input, ctx = {}) {
     case "send_message": {
       // 发送到非当前会话的群，需二次确认
       if (input.chat_id && input.chat_id !== ctx.chatId) {
-        if (!_checkOutboundConfirm(ctx, input.chat_id, input.text)) {
+        if (!_checkOutboundConfirm(ctx, input.chat_id, input.text, "send_message", input)) {
           return JSON.stringify({
             requires_confirmation: true,
             target: input.chat_id,
@@ -1838,7 +1840,7 @@ async function executeTool(name, input, ctx = {}) {
       const cardChatId = input.chat_id === "ctx.chatId" ? ctx.chatId : (input.chat_id || ctx.chatId);
       // 跨会话卡片也需要隐私确认
       if (cardChatId && cardChatId !== ctx.chatId) {
-        if (!_checkOutboundConfirm(ctx, cardChatId, `[卡片] ${input.title}`)) {
+        if (!_checkOutboundConfirm(ctx, cardChatId, `[卡片] ${input.title}`, "send_card", { ...input, chat_id: cardChatId })) {
           return JSON.stringify({
             requires_confirmation: true,
             target: cardChatId,
@@ -1858,7 +1860,7 @@ async function executeTool(name, input, ctx = {}) {
       return JSON.stringify(await getMessages(input.chat_id, input.page_size));
     case "send_direct_message": {
       // 私信始终需要二次确认
-      if (!_checkOutboundConfirm(ctx, input.open_id || "dm", input.text)) {
+      if (!_checkOutboundConfirm(ctx, input.open_id || "dm", input.text, "send_direct_message", input)) {
         return JSON.stringify({
           requires_confirmation: true,
           target: input.open_id,
@@ -1898,7 +1900,7 @@ async function executeTool(name, input, ctx = {}) {
     case "forward_message": {
       // 转发到非当前会话，需二次确认
       if (input.chat_id && input.chat_id !== ctx.chatId) {
-        if (!_checkOutboundConfirm(ctx, input.chat_id, `转发消息 ${input.message_id}`)) {
+        if (!_checkOutboundConfirm(ctx, input.chat_id, `转发消息 ${input.message_id}`, "forward_message", input)) {
           return JSON.stringify({
             requires_confirmation: true,
             target: input.chat_id,
@@ -2214,6 +2216,7 @@ async function generateCreativeContent(brief, ctx = {}) {
 async function runAgent(chatId, userContent, onProgress, msgId = null) {
   // ── 隐私安全：检测用户是否在确认一条待发送操作 ────────────────────────────────
   let isConfirmTurn = false;
+  let confirmedPending = null; // 存储确认的 pending 信息（含 toolName/toolInput）
   if (pendingConfirmations.has(chatId)) {
     const pending = pendingConfirmations.get(chatId);
     if (Date.now() < pending.expires) {
@@ -2226,9 +2229,10 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
       if (/[确認]认[发發]?送|[确認]认转发|^[\s]*(发送|确认|是的|好的|yes|confirm|ok)/i.test(msgText.trim())) {
         // 用户确认，写入一次性通行证
         confirmedOps.add(`${chatId}:${pending.target}`);
+        confirmedPending = { ...pending }; // 保存副本供注入用
         pendingConfirmations.delete(chatId);
         isConfirmTurn = true;
-        console.log(`[privacy] 用户确认发送 target=${pending.target}`);
+        console.log(`[privacy] 用户确认发送 target=${pending.target} tool=${pending.toolName}`);
       }
     } else {
       pendingConfirmations.delete(chatId);
@@ -2272,10 +2276,14 @@ async function runAgent(chatId, userContent, onProgress, msgId = null) {
   while (history.length > 0 && history[0].role !== "user") history.shift();
 
   // messages uses full content for current turn (e.g. actual image blocks)
-  // If this is a text confirmation turn, inject a note so Claude knows to proceed directly
-  const currentUserContent = isConfirmTurn && typeof userContent === "string"
-    ? `${userContent}\n\n[系统提示：用户已明确确认，请立即重新调用被拦截的发送工具（send_direct_message / send_message / forward_message），直接执行，不要再展示确认卡片或再次询问。]`
-    : userContent;
+  // If this is a text confirmation turn, inject tool params so Claude can replay the call directly
+  let currentUserContent = userContent;
+  if (isConfirmTurn && typeof userContent === "string" && confirmedPending) {
+    const toolHint = confirmedPending.toolName && confirmedPending.toolInput
+      ? `请立即调用工具 ${confirmedPending.toolName}，参数：${JSON.stringify(confirmedPending.toolInput)}。`
+      : `请立即重新调用被拦截的发送工具（send_direct_message / send_message / forward_message）。`;
+    currentUserContent = `${userContent}\n\n[系统提示：用户已明确确认，${toolHint}直接执行，不要再展示确认卡片或再次询问。]`;
+  }
   const messages = [
     ...history.slice(0, -1),
     { role: "user", content: currentUserContent },
