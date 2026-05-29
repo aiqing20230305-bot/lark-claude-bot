@@ -1757,8 +1757,27 @@ function _checkOutboundConfirm(ctx, target, preview, toolName = null, toolInput 
 // Execute a tool call
 async function executeTool(name, input, ctx = {}) {
   switch (name) {
-    case "run_dreamina":
+    case "run_dreamina": {
+      const isVideoTask = (input.args || []).some(a => typeof a === "string" && a.includes("video"));
+      if (isVideoTask && ctx.chatId) {
+        // 视频生成耗时 2-5 分钟，异步处理避免超时
+        const chatId = ctx.chatId;
+        dreaminaExec(input.args).then(result => {
+          const url = result?.video_url || result?.url || result?.result?.url;
+          if (url) {
+            sendMessage(chatId, `🎬 视频生成完成！\n${url}`);
+          } else if (result?.error) {
+            sendMessage(chatId, `⚠️ 视频生成失败：${result.error}`);
+          } else {
+            sendMessage(chatId, `🎬 视频生成完成！\n${JSON.stringify(result).slice(0, 300)}`);
+          }
+        }).catch(err => {
+          sendMessage(chatId, `⚠️ 视频生成出错：${err.message}`);
+        });
+        return JSON.stringify({ status: "submitted", message: "🎬 视频生成任务已提交，正在生成（约2-3分钟），完成后自动发送给你 ⏳" });
+      }
       return JSON.stringify(await dreaminaExec(input.args));
+    }
     case "run_lark_cli": {
       const args = [...(input.args || [])];
       // 检查是否是 IM 写操作（POST/PUT 到 /im/v1/messages 或 /messages/*/forward）
