@@ -39,7 +39,8 @@ function runCmd(bin, args, timeoutMs = 30000) {
     const output = execSync(cmd, {
       encoding: "utf8",
       timeout: timeoutMs,
-      env: { ...process.env, PATH: process.env.PATH },
+      // LARK_CLI_NO_PROXY=1 防止 lark-cli 走系统 HTTP 代理（否则 Bitable 等接口返回 HTML）
+      env: { ...process.env, PATH: process.env.PATH, LARK_CLI_NO_PROXY: "1" },
     });
     try {
       return { output: JSON.parse(output) };
@@ -83,8 +84,8 @@ app.post("/dreamina", (req, res) => {
   if (!DREAMINA_ALLOWED.includes(args[0])) {
     return res.status(400).json({ error: `不允许的 dreamina 命令: ${args[0]}` });
   }
-  // 视频生成任务最长等 120 秒
-  const timeout = args[0].includes("video") ? 120000 : 60000;
+  // 视频生成任务最长等 300 秒（5分钟），图片任务 60 秒
+  const timeout = args[0].includes("video") ? 300000 : 60000;
   res.json(runCmd(DREAMINA, args, timeout));
 });
 
@@ -764,14 +765,34 @@ app.get("/history/:chatId", async (req, res) => {
 
 // 追加对话轮次 { chatId, turns: [{role, content}] }
 app.post("/history/append", async (req, res) => {
-  const { chatId, turns } = req.body || {};
+  const { chatId, turns, dedup = false } = req.body || {};
   if (!chatId || !Array.isArray(turns) || turns.length === 0) {
     return res.status(400).json({ error: "chatId and turns required" });
   }
   try {
     const { appToken, tableId } = await ensureHistoryTable();
     const now = Date.now();
+
+    // 如果调用方要求去重，先拉已有时间戳
+    let existingTs = new Set();
+    if (dedup) {
+      const existing = runCmd(LARK_CLI, [
+        "api", "GET",
+        `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records`,
+        "--params", JSON.stringify({ filter: `CurrentValue.[chat_id]="${chatId}"`, page_size: 200 }),
+        "--as", "bot",
+      ], 15000);
+      (existing.output?.data?.items || []).forEach(r => {
+        if (r.fields?.timestamp) existingTs.add(String(r.fields.timestamp));
+      });
+    }
+
+    let written = 0;
     for (let i = 0; i < turns.length; i++) {
+      // 优先用 turn 自带的原始时间戳，否则用当前时间
+      const ts = String(turns[i].timestamp || now + i);
+      if (dedup && existingTs.has(ts)) continue; // 跳过已有记录
+
       runCmd(LARK_CLI, [
         "api", "POST",
         `/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records`,
@@ -781,12 +802,13 @@ app.post("/history/append", async (req, res) => {
             chat_id:   chatId,
             role:      turns[i].role,
             content:   (turns[i].content || "").slice(0, 3000),
-            timestamp: String(now + i),
+            timestamp: ts,
           },
         }),
       ], 10000);
+      written++;
     }
-    res.json({ ok: true, count: turns.length });
+    res.json({ ok: true, written, skipped: turns.length - written });
   } catch (err) {
     console.error("[history/append]", err.message);
     res.status(500).json({ error: err.message });
@@ -848,25 +870,28 @@ app.post("/memory/:chatId", async (req, res) => {
       last_updated: new Date().toISOString(),
     };
 
-    if (existing._recordId) {
+    let recordId = existing._recordId;
+    if (recordId) {
       runCmd(LARK_CLI, [
         "api", "PUT",
-        `/open-apis/bitable/v1/apps/${appToken}/tables/${memoryTableId}/records/${existing._recordId}`,
+        `/open-apis/bitable/v1/apps/${appToken}/tables/${memoryTableId}/records/${recordId}`,
         "--as", "bot",
         "--data", JSON.stringify({ fields }),
       ], 10000);
     } else {
-      runCmd(LARK_CLI, [
+      const created = runCmd(LARK_CLI, [
         "api", "POST",
         `/open-apis/bitable/v1/apps/${appToken}/tables/${memoryTableId}/records`,
         "--as", "bot",
         "--data", JSON.stringify({ fields }),
       ], 10000);
+      // 从 POST 响应里拿 record_id，避免缓存 null 导致重复新建
+      recordId = created.output?.data?.record?.record_id || null;
     }
 
-    // 更新缓存
+    // 更新缓存（带正确的 record_id）
     _memCache.set(chatId, {
-      data: { summary, keyFacts, turnCount, lastUpdated: fields.last_updated, _recordId: existing._recordId },
+      data: { summary, keyFacts, turnCount, lastUpdated: fields.last_updated, _recordId: recordId },
       expiresAt: Date.now() + MEM_TTL,
     });
     res.json({ ok: true });
