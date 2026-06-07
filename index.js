@@ -1584,8 +1584,15 @@ const tools = [
 引擎选择规则：
 - 写实/精细/照片感图片 → engine: "gpt-image-1"
 - 艺术感/动漫/插画/水墨/概念艺术图片 → engine: "dreamina"
-- 任何视频需求 → engine: "dreamina"（自动选 text2video 或 image2video）
-- 不确定 → engine: "auto"`,
+- TikTok竖屏短视频/商业广告/产品展示视频 → engine: "seedance"（Seedance 2.0，专为短视频优化，支持4-15秒）
+- 普通视频/图生视频 → engine: "dreamina"
+- 不确定 → engine: "auto"
+
+Seedance 特别说明：
+- 专为 TikTok/短视频内容优化，720p 高清
+- 支持比例：9:16（竖屏TikTok）/ 16:9（横版）/ 1:1（方形）
+- 时长：4-15秒（用 video_duration 指定）
+- 适合：商业广告、产品展示、品牌视频、世界杯营销素材`,
     input_schema: {
       type: "object",
       properties: {
@@ -1596,22 +1603,22 @@ const tools = [
         },
         prompt_en: {
           type: "string",
-          description: "英文生成提示词，详细描述画面内容、风格、光线、构图等，用于实际生成",
+          description: "英文生成提示词，详细描述画面内容、风格、光线、构图等，用于实际生成。视频建议用6层结构：[主体+动作]+[镜头运动]+[光线]+[风格]+[技术参数]",
         },
         style: {
           type: "string",
-          enum: ["realistic", "illustration", "3d", "anime", "minimalist", "painting", "cinematic", "other"],
-          description: "风格：realistic写实 / illustration插画 / 3d三维 / anime动漫 / minimalist极简 / painting油画水彩 / cinematic电影感",
+          enum: ["realistic", "illustration", "3d", "anime", "minimalist", "painting", "cinematic", "commercial", "other"],
+          description: "风格：realistic写实 / illustration插画 / 3d三维 / anime动漫 / minimalist极简 / painting油画水彩 / cinematic电影感 / commercial商业广告",
         },
         aspect_ratio: {
           type: "string",
           enum: ["1:1", "16:9", "9:16", "4:3", "3:4"],
-          description: "宽高比：1:1方图 / 16:9横版 / 9:16竖版海报 / 4:3 / 3:4",
+          description: "宽高比：1:1方图 / 16:9横版 / 9:16竖版（TikTok竖屏）/ 4:3 / 3:4",
         },
         engine: {
           type: "string",
-          enum: ["auto", "gpt-image-1", "dreamina"],
-          description: "生成引擎：auto自动选择 / gpt-image-1写实细节强 / dreamina艺术风格强",
+          enum: ["auto", "gpt-image-1", "dreamina", "seedance"],
+          description: "生成引擎：auto自动 / gpt-image-1写实图片 / dreamina艺术图片&图生视频 / seedance TikTok短视频专用",
         },
         count: {
           type: "number",
@@ -1623,8 +1630,7 @@ const tools = [
         },
         video_duration: {
           type: "number",
-          enum: [5, 10],
-          description: "视频时长（秒），仅 video 类型有效，默认5",
+          description: "视频时长（秒）。dreamina: 5或10；seedance: 4-15，建议5或10",
         },
       },
       required: ["media_type", "prompt_en", "style", "aspect_ratio", "engine"],
@@ -2147,8 +2153,8 @@ function toolProgressMsg(name, input) {
   if (name === "notebooklm_query")         return `📚 正在用 NotebookLM 深度研究...`;
   if (name === "generate_creative_content") {
     const type = input?.media_type === "video" ? "视频" : "图片";
-    const engine = input?.engine === "dreamina" ? "Dreamina" : "GPT-Image";
-    return `🎨 正在用 ${engine} 生成${type}...`;
+    const engineLabel = input?.engine === "seedance" ? "Seedance 2.0 🎬" : input?.engine === "dreamina" ? "Dreamina" : "GPT-Image";
+    return `🎨 正在用 ${engineLabel} 生成${type}...`;
   }
   return null;
 }
@@ -2171,7 +2177,8 @@ async function generateCreativeContent(brief, ctx = {}) {
   let actualEngine = engine;
   if (engine === "auto") {
     if (media_type === "video") {
-      actualEngine = "dreamina";
+      // 商业/竖屏/TikTok内容默认用 Seedance 2.0
+      actualEngine = ["cinematic", "commercial", "realistic"].includes(style) ? "seedance" : "dreamina";
     } else if (["anime", "illustration", "painting"].includes(style)) {
       actualEngine = "dreamina";
     } else {
@@ -2179,7 +2186,37 @@ async function generateCreativeContent(brief, ctx = {}) {
     }
   }
 
-  // ── VIDEO ──────────────────────────────────────────────────────────────────
+  // ── VIDEO via Seedance 2.0（TikTok专用）──────────────────────────────────────
+  if (media_type === "video" && actualEngine === "seedance") {
+    const ratio = DREAMINA_RATIO_MAP[aspect_ratio] || "9:16";
+    const dur = Math.min(Math.max(video_duration || 5, 4), 15);
+    const args = reference_image_url
+      ? ["image2video", "--image_url", reference_image_url, "--prompt", prompt_en,
+         "--ratio", ratio, "--duration", String(dur), "--model_version", "seedance2.0"]
+      : ["text2video", "--prompt", prompt_en,
+         "--ratio", ratio, "--duration", String(dur), "--model_version", "seedance2.0"];
+
+    const submitResult = await dreaminaExec(args);
+    const sd = typeof submitResult.output === "object" ? submitResult.output : {};
+    const submitId = sd?.data?.submit_id;
+    if (!submitId) return { error: "Seedance 视频任务提交失败", detail: sd };
+
+    // Poll up to 4 min（Seedance稍慢）
+    for (let i = 0; i < 24; i++) {
+      await new Promise((r) => setTimeout(r, 10000));
+      const qr = await dreaminaExec(["query_result", "--submit_id", submitId]);
+      const qd = typeof qr.output === "object" ? qr.output : {};
+      if (qd?.data?.status === "success") {
+        return { success: true, type: "video", engine: "seedance2.0", submit_id: submitId, result: qd.data };
+      }
+      if (qd?.data?.status === "failed") {
+        return { error: "Seedance 视频生成失败", detail: qd.data };
+      }
+    }
+    return { error: "Seedance 视频生成超时，可稍后用 run_dreamina query_result 查询 submit_id=" + submitId };
+  }
+
+  // ── VIDEO via Dreamina（图生视频/艺术风格）──────────────────────────────────
   if (media_type === "video") {
     const ratio = DREAMINA_RATIO_MAP[aspect_ratio] || "16:9";
     const args = reference_image_url
@@ -2197,7 +2234,7 @@ async function generateCreativeContent(brief, ctx = {}) {
       const qr = await dreaminaExec(["query_result", "--submit_id", submitId]);
       const qd = typeof qr.output === "object" ? qr.output : {};
       if (qd?.data?.status === "success") {
-        return { success: true, type: "video", submit_id: submitId, result: qd.data };
+        return { success: true, type: "video", engine: "dreamina", submit_id: submitId, result: qd.data };
       }
       if (qd?.data?.status === "failed") {
         return { error: "视频生成失败", detail: qd.data };
@@ -2476,6 +2513,49 @@ ${memorySection}
 1. 调用 get_chats 获取群列表
 2. send_card title=「发给哪个群？」options=[内容运营Backlog, 产品大本营, 内容工厂杂谈, 其他]
 3. 用户点击 → 调用 send_message 直接发送
+
+## 📋 计划模式（Plan Mode）
+
+当用户请求包含**多个连续任务**时，执行前先发布执行计划：
+
+【触发条件——满足任意一条即进入 Plan Mode】
+- 请求包含"然后"、"接着"、"同时"、"还有"、"以及"、"并且"等多任务连接词
+- 需要 3 步以上才能完成
+- 涉及多个飞书功能（如：搜索+发消息+创建文档）
+- 涉及多人或多个群的操作
+
+【执行流程】
+1. **先发计划卡片**：用 send_card 发布步骤清单（title="📋 执行计划"，列出 ① ② ③ 每步内容）
+2. **依次执行**：每步开始前用 onProgress 汇报（如"正在执行第2步：发送消息到内容运营群"）
+3. **完成汇总**：所有步骤完成后，用一条文字总结完成情况
+
+【计划卡片示例】
+- title: "📋 执行计划（共3步）"
+- content: "① 查询内容运营群 ID\n② 发送世界杯方案到群里\n③ @相关成员确认收到"
+- 按钮: ["开始执行", "取消"]
+
+## 🎬 视频生产能力（TikTok / 短视频内容）
+
+**Seedance 2.0 引擎**——专为 TikTok 竖屏内容优化：
+- 分辨率：720p | 比例：9:16（竖屏） | 时长：4-15秒
+- 适合：商业广告、产品展示、品牌内容、世界杯营销素材
+
+【脚本→视频生产工作流】
+当用户提供脚本/文案需要生产 TikTok 视频时：
+1. 将脚本拆分为分镜（每镜头建议5秒，即约15-25字文案）
+2. 为每个分镜生成专业英文提示词（6层结构：主体+动作+镜头运动+光线+风格+技术参数）
+3. 用 generate_creative_content（engine="seedance"）依次生成各镜头
+4. 汇总镜头链接，附上提示词方便复用
+
+【Seedance 提示词 6层结构模板】
+[主体描述] + [动作/状态] + [镜头运动：slow dolly/pan/static] + [光线：golden hour/studio] + [风格：cinematic/commercial] + [9:16 vertical TikTok, 720p]
+
+示例：A young woman holds Hisense TV remote, pointing at a 4K screen showing a World Cup match goal celebration, slow dolly forward, golden hour lighting, commercial style, 9:16 vertical TikTok, 720p
+
+【引擎选择】
+- TikTok竖屏短视频 → engine: "seedance"，aspect_ratio: "9:16"，video_duration: 5
+- 高质量品牌广告 → engine: "seedance"，video_duration: 10-15
+- 横版宣传视频 → engine: "seedina"，aspect_ratio: "16:9"
 
 ## 其他规则
 1. 使用工具获取实时数据，不要凭记忆回答
