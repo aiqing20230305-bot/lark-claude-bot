@@ -2204,7 +2204,7 @@ async function recoverMissedMessages() {
           const reply = await Promise.race([
             runAgent(chatId, userContent, null, msg.message_id),
             new Promise((_, reject) =>
-              setTimeout(() => reject(new Error("处理超时（120秒）")), 120_000)
+              setTimeout(() => reject(new Error("处理超时（300秒），请稍后重试")), 300_000)
             ),
           ]);
           await replyToLark(msg.message_id, reply);
@@ -3139,11 +3139,11 @@ app.post("/webhook", async (req, res) => {
       }
     };
 
-    const AGENT_TIMEOUT_MS = 120_000;
+    const AGENT_TIMEOUT_MS = 300_000;
     const reply = await Promise.race([
       runAgent(chatId, userContent, onProgress, msgId),
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("处理超时（120秒），请稍后重试")), AGENT_TIMEOUT_MS)
+        setTimeout(() => reject(new Error("处理超时（300秒），请稍后重试")), AGENT_TIMEOUT_MS)
       ),
     ]);
     console.log(`[回复] ${reply.slice(0, 100)}`);
