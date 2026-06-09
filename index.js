@@ -651,17 +651,27 @@ async function patchChatCard(messageId, content, title = "✅ 完成", color = "
 const OWNER_OPEN_ID = "ou_e70659115978d42207ac0cc2ade25508"; // 张经纬
 
 const RULE_CHANGE_PATTERNS = [
+  // 英文注入
   /ignore.{0,20}(previous|above|all|system).{0,20}(instruction|rule|prompt)/i,
-  /forget.{0,20}(you are|your role|previous|instruction)/i,
+  /forget.{0,20}(you are|your role|previous|instruction|everything)/i,
   /(override|bypass|disable|remove).{0,20}(rule|filter|restriction|safety)/i,
-  /(你|请|要|必须).{0,10}(忘记|无视|取消|删除).{0,20}(规则|指令|限制|设定)/i,
-  /(修改|更改|变更|重置).{0,10}(你的|系统|自己的).{0,10}(规则|提示|设定|行为|指令)/i,
-  /(以后|从现在|今后).{0,15}(你要|你必须|你应该|你不能|你可以).{0,30}(永远|不再|总是)/i,
   /act as.{0,20}(jailbreak|DAN|uncensored|unfiltered)/i,
   /\bDAN\b.{0,10}(mode|prompt)|\bdo anything now\b/i,
   /(show|reveal|tell me|output|print).{0,20}(your|the|system).{0,20}(prompt|instruction|rules)/i,
-  /(说出|告诉我|输出|展示|泄露).{0,10}(你的|系统|原始).{0,10}(提示词|规则|指令|system prompt)/i,
-  /(pretend|假装|扮演).{0,20}(you have no|没有限制|without restriction|unrestricted)/i,
+  /(pretend|假装|扮演).{0,30}(you have no|没有限制|without restriction|unrestricted)/i,
+  // 中文注入 — 动词在前（"忘记你之前的..."）
+  /(忘记|忘掉|清除|抹去).{0,20}(你|所有|之前|以前|原有).{0,20}(指令|规则|设定|身份|限制)/i,
+  /(忘记|忘掉).{0,10}(你是|你的身份|你的规则)/i,
+  // 中文注入 — 动词在后（"你必须忘记..."）
+  /(你|请|要|必须).{0,10}(忘记|无视|取消|删除|清除).{0,20}(规则|指令|限制|设定|身份)/i,
+  // 规则变更请求
+  /(修改|更改|变更|重置).{0,10}(你的|系统|自己的).{0,10}(规则|提示|设定|行为|指令)/i,
+  /(以后|从现在|今后).{0,15}(你要|你必须|你应该|你不能|你可以).{0,30}(永远|不再|总是)/i,
+  // 身份替换
+  /(从现在|以后|现在起).{0,10}(你是|你变成|你成为).{0,30}(没有限制|无限制|不受限制|另一个|新的)/i,
+  /(没有限制|无任何限制|不受任何限制).{0,10}(AI|助手|机器人|bot)/i,
+  // 系统提示泄露
+  /(说出|告诉我|输出|展示|泄露|重复).{0,10}(你的|系统|原始).{0,10}(提示词|规则|指令|system prompt)/i,
 ];
 
 function detectRuleChangeAttempt(text) {
