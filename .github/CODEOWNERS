@@ -1,0 +1,11 @@
+# 经纬2号规则机制变更 — 必须经张经纬 (@aiqing20230305) review 后方可合并
+#
+# 任何对以下文件的 PR，GitHub 会自动要求 @aiqing20230305 审核：
+#   index.js   — 系统提示词 & 行为规则
+#   CODEOWNERS — 本文件（防止绕过审核）
+#
+# 生效前提：在 GitHub → Settings → Branches → Branch protection rules
+#   勾选 "Require a pull request before merging" + "Require review from Code Owners"
+
+index.js            @aiqing20230305
+.github/CODEOWNERS  @aiqing20230305
