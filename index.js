@@ -600,6 +600,53 @@ async function updateCard(messageId, { title, content, options, headerColor }) {
   return data.code === 0 ? { ok: true } : { ok: false, error: data.msg };
 }
 
+// ── 进度卡片（无按钮，用于进度展示和最终回复）──────────────────────────────────────
+function buildProgressCardJson(content, title = "⏳ 处理中...", color = "grey") {
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: "plain_text", content: title },
+      template: color,
+    },
+    elements: [
+      { tag: "div", text: { tag: "lark_md", content: content } },
+    ],
+  };
+}
+
+async function createChatCard(chatId, content, title = "⏳ 处理中...", color = "grey") {
+  const token = await getAppToken();
+  const card = buildProgressCardJson(content, title, color);
+  const res = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      receive_id: chatId,
+      msg_type: "interactive",
+      content: JSON.stringify(card),
+    }),
+  });
+  const data = await res.json();
+  if (data.code !== 0) {
+    console.error("[createChatCard失败]", data.msg, data.code);
+    return null;
+  }
+  return data.data?.message_id;
+}
+
+async function patchChatCard(messageId, content, title = "✅ 完成", color = "blue") {
+  const token = await getAppToken();
+  const card = buildProgressCardJson(content, title, color);
+  const res = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ content: JSON.stringify(card) }),
+  });
+  const data = await res.json();
+  if (data.code !== 0) console.error("[patchChatCard失败]", data.msg, data.code, messageId?.slice(-8));
+  return data.code === 0;
+}
+
 async function getPrimaryCalendarId() {
   const cals = await userApiCall("/open-apis/calendar/v4/calendars?page_size=10");
   if (cals.data?.calendar_list) {
@@ -2869,6 +2916,7 @@ app.post("/webhook", async (req, res) => {
 
   // Declare msgId outside try so catch block can reference it
   let msgId;
+  let progressCardId = null;
 
   try {
     const event = body.event;
@@ -2991,16 +3039,28 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`[收到:${message.message_type}] ${chatId}`);
 
-    // 立即发「正在处理」提示，让用户知道 bot 已收到
-    replyToLark(msgId, "⏳ 收到，正在处理中...").catch((e) => {
-      const errEntry = { ts: new Date().toISOString(), stage: "ack", msg_id: msgId?.slice(-8), error: e.message, code: e.code };
-      recentErrors.push(errEntry);
-      if (recentErrors.length > 20) recentErrors.shift();
-      console.error("[ack失败]", JSON.stringify(errEntry));
-    });
+    // 发一张进度卡片（整个任务只更新这一张，不再新发消息）
+    try {
+      progressCardId = await createChatCard(chatId, "已收到，正在思考中...", "⏳ 处理中...", "grey");
+    } catch (e) {
+      console.error("[进度卡片失败]", e.message);
+    }
+    if (!progressCardId) {
+      // 降级：卡片失败时用文字 ack
+      replyToLark(msgId, "⏳ 收到，正在处理中...").catch((e) => {
+        const errEntry = { ts: new Date().toISOString(), stage: "ack", msg_id: msgId?.slice(-8), error: e.message, code: e.code };
+        recentErrors.push(errEntry);
+        if (recentErrors.length > 20) recentErrors.shift();
+        console.error("[ack失败]", JSON.stringify(errEntry));
+      });
+    }
 
-    // 多步任务时实时推送进度
-    const onProgress = (msg) => replyToLark(msgId, msg);
+    // 进度更新：只 PATCH 那张卡片，不发新消息
+    const onProgress = async (msg) => {
+      if (progressCardId) {
+        await patchChatCard(progressCardId, msg, "⏳ 处理中...", "grey").catch(() => {});
+      }
+    };
 
     const AGENT_TIMEOUT_MS = 120_000;
     const reply = await Promise.race([
@@ -3011,13 +3071,20 @@ app.post("/webhook", async (req, res) => {
     ]);
     console.log(`[回复] ${reply.slice(0, 100)}`);
 
-    await replyToLark(msgId, reply);
+    // 最终回复：PATCH 那张卡片（不发新消息）
+    if (progressCardId) {
+      await patchChatCard(progressCardId, reply, "✅ 经纬", "blue").catch(() => {});
+    } else {
+      await replyToLark(msgId, reply);
+    }
   } catch (err) {
     const errEntry = { ts: new Date().toISOString(), stage: "agent", msg_id: msgId?.slice(-8), error: err.message, code: err.code };
     recentErrors.push(errEntry);
     if (recentErrors.length > 20) recentErrors.shift();
     console.error("[错误]", err.message, err.stack?.slice(0, 300));
-    if (msgId) {
+    if (progressCardId) {
+      await patchChatCard(progressCardId, `⚠️ 出错了：${err.message.slice(0, 200)}`, "❌ 出错", "red").catch(() => {});
+    } else if (msgId) {
       try {
         await replyToLark(msgId, `⚠️ 出错了：${err.message.slice(0, 200)}`);
       } catch (replyErr) {
