@@ -377,6 +377,102 @@ async function runRemotionExec(compositionId, outputPath, props) {
   }
 }
 
+// ── Seedance via ByteDance Ark API（直连，不经过本地代理）──────────────────────
+const ARK_VIDEO_BASE = "https://ark.cn-beijing.volces.com/api/v3";
+
+async function arkVideoSubmit({ prompt, duration = 5, ratio = "9:16" }) {
+  const apiKey = process.env.SEEDANCE_ARK_KEY;
+  if (!apiKey) return { error: "SEEDANCE_ARK_KEY 未配置" };
+  const modelId = process.env.SEEDANCE_MODEL_ID || "doubao-seedance-1-0-lite-t2v-250428";
+  try {
+    const res = await fetch(`${ARK_VIDEO_BASE}/contents/generations/tasks`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: modelId,
+        content: [{ type: "text", text: prompt }],
+        parameters: { duration, ratio },
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: `Ark API error ${res.status}: ${data?.error?.message || JSON.stringify(data)}` };
+    return { task_id: data.id, status: data.status, model: data.model };
+  } catch (err) {
+    return { error: `Ark API 连接失败: ${err.message}` };
+  }
+}
+
+async function arkVideoQuery(taskId) {
+  const apiKey = process.env.SEEDANCE_ARK_KEY;
+  if (!apiKey) return { error: "SEEDANCE_ARK_KEY 未配置" };
+  try {
+    const res = await fetch(`${ARK_VIDEO_BASE}/contents/generations/tasks/${taskId}`, {
+      headers: { "Authorization": `Bearer ${apiKey}` },
+    });
+    return await res.json();
+  } catch (err) {
+    return { error: `查询失败: ${err.message}` };
+  }
+}
+
+// 后台轮询：任务完成后主动推送飞书消息（不阻塞 agent loop）
+function startVideoBackgroundPoll(taskId, chatId, label, queryFn) {
+  const MAX_POLLS = 120; // 30s × 120 = 60 min
+  let count = 0;
+  const handle = setInterval(async () => {
+    count++;
+    if (count > MAX_POLLS) {
+      clearInterval(handle);
+      sendMessage(chatId, `⏰ 「${label}」渲染超时（60分钟），请稍后手动查询 task_id: ${taskId}`).catch(() => {});
+      return;
+    }
+    try {
+      const r = await queryFn(taskId);
+      const status = r?.status;
+      if (status === "succeeded") {
+        clearInterval(handle);
+        const videoUrl = r?.content?.find?.(c => c.type === "video")?.video_url
+          || r?.video_url || r?.result?.video_url || "（请查看 task_id）";
+        sendMessage(chatId, `✅ 「${label}」渲染完成！\n🎬 ${videoUrl}`).catch(() => {});
+      } else if (status === "failed") {
+        clearInterval(handle);
+        sendMessage(chatId, `❌ 「${label}」渲染失败: ${r?.error_message || JSON.stringify(r).slice(0, 200)}`).catch(() => {});
+      }
+      // 其他状态（queued / running）继续等
+    } catch (err) {
+      console.error("[VideoBackgroundPoll] error:", taskId, err.message);
+    }
+  }, 30_000);
+}
+
+// 用 dreamina CLI 的后台轮询（仅用于降级场景）
+function startDreaminaBackgroundPoll(submitId, chatId, label) {
+  const MAX_POLLS = 120;
+  let count = 0;
+  const handle = setInterval(async () => {
+    count++;
+    if (count > MAX_POLLS) {
+      clearInterval(handle);
+      sendMessage(chatId, `⏰ 「${label}」渲染超时，submit_id: ${submitId}`).catch(() => {});
+      return;
+    }
+    try {
+      const qr = await dreaminaExec(["query_result", "--submit_id", submitId]);
+      const qd = typeof qr.output === "object" ? qr.output : {};
+      if (qd?.data?.status === "success") {
+        clearInterval(handle);
+        const videoUrl = qd.data?.video_url || qd.data?.url || JSON.stringify(qd.data).slice(0, 200);
+        sendMessage(chatId, `✅ 「${label}」渲染完成！\n🎬 ${videoUrl}`).catch(() => {});
+      } else if (qd?.data?.status === "failed") {
+        clearInterval(handle);
+        sendMessage(chatId, `❌ 「${label}」渲染失败: ${JSON.stringify(qd.data).slice(0, 200)}`).catch(() => {});
+      }
+    } catch (err) {
+      console.error("[DreaminaBackgroundPoll] error:", submitId, err.message);
+    }
+  }, 30_000);
+}
+
 // Chinese hot topics via local proxy
 async function hotTopicsExec(platform = "all", limit = 20) {
   const proxyUrl = process.env.LARK_PROXY_URL;
@@ -2434,57 +2530,60 @@ async function generateCreativeContent(brief, ctx = {}) {
   if (media_type === "video" && actualEngine === "seedance") {
     const ratio = DREAMINA_RATIO_MAP[aspect_ratio] || "9:16";
     const dur = Math.min(Math.max(video_duration || 5, 4), 15);
+    const label = (brief.subject || prompt_en).slice(0, 24);
+
+    if (process.env.SEEDANCE_ARK_KEY) {
+      // ✅ 直连 Ark API + 后台轮询（不阻塞 agent，不受超时限制）
+      const submitResult = await arkVideoSubmit({ prompt: prompt_en, duration: dur, ratio });
+      if (submitResult.error) return JSON.stringify({ error: submitResult.error });
+      const taskId = submitResult.task_id;
+      if (!taskId) return JSON.stringify({ error: "Ark API 未返回 task_id", detail: submitResult });
+      if (ctx.chatId) startVideoBackgroundPoll(taskId, ctx.chatId, label, arkVideoQuery);
+      return JSON.stringify({
+        status: "submitted",
+        engine: "seedance-ark",
+        task_id: taskId,
+        message: `🎬 Seedance 视频已提交（Ark直连），后台轮询中，完成后自动推送 ⏳`,
+      });
+    }
+
+    // 降级：dreamina CLI + 后台轮询
     const args = reference_image_url
       ? ["image2video", "--image_url", reference_image_url, "--prompt", prompt_en,
          "--ratio", ratio, "--duration", String(dur), "--model_version", "seedance2.0"]
       : ["text2video", "--prompt", prompt_en,
          "--ratio", ratio, "--duration", String(dur), "--model_version", "seedance2.0"];
-
     const submitResult = await dreaminaExec(args);
     const sd = typeof submitResult.output === "object" ? submitResult.output : {};
     const submitId = sd?.data?.submit_id;
-    if (!submitId) return { error: "Seedance 视频任务提交失败", detail: sd };
-
-    // Poll up to 4 min（Seedance稍慢）
-    for (let i = 0; i < 24; i++) {
-      await new Promise((r) => setTimeout(r, 10000));
-      const qr = await dreaminaExec(["query_result", "--submit_id", submitId]);
-      const qd = typeof qr.output === "object" ? qr.output : {};
-      if (qd?.data?.status === "success") {
-        return { success: true, type: "video", engine: "seedance2.0", submit_id: submitId, result: qd.data };
-      }
-      if (qd?.data?.status === "failed") {
-        return { error: "Seedance 视频生成失败", detail: qd.data };
-      }
-    }
-    return { error: "Seedance 视频生成超时，可稍后用 run_dreamina query_result 查询 submit_id=" + submitId };
+    if (!submitId) return JSON.stringify({ error: "Seedance 视频任务提交失败", detail: sd });
+    if (ctx.chatId) startDreaminaBackgroundPoll(submitId, ctx.chatId, label);
+    return JSON.stringify({
+      status: "submitted",
+      engine: "seedance-dreamina",
+      submit_id: submitId,
+      message: `🎬 Seedance 视频已提交，后台轮询中（60分钟超时），完成后自动推送 ⏳`,
+    });
   }
 
-  // ── VIDEO via Dreamina（图生视频/艺术风格）──────────────────────────────────
+  // ── VIDEO via Dreamina（图生视频/艺术风格）+ 后台轮询 ─────────────────────────
   if (media_type === "video") {
     const ratio = DREAMINA_RATIO_MAP[aspect_ratio] || "16:9";
+    const label = (brief.subject || prompt_en).slice(0, 24);
     const args = reference_image_url
       ? ["image2video", "--image_url", reference_image_url, "--prompt", prompt_en, "--duration", String(video_duration)]
       : ["text2video", "--prompt", prompt_en, "--duration", String(video_duration)];
-
     const submitResult = await dreaminaExec(args);
     const sd = typeof submitResult.output === "object" ? submitResult.output : {};
     const submitId = sd?.data?.submit_id;
-    if (!submitId) return { error: "视频任务提交失败", detail: sd };
-
-    // Poll up to 3 min (18 × 10s)
-    for (let i = 0; i < 18; i++) {
-      await new Promise((r) => setTimeout(r, 10000));
-      const qr = await dreaminaExec(["query_result", "--submit_id", submitId]);
-      const qd = typeof qr.output === "object" ? qr.output : {};
-      if (qd?.data?.status === "success") {
-        return { success: true, type: "video", engine: "dreamina", submit_id: submitId, result: qd.data };
-      }
-      if (qd?.data?.status === "failed") {
-        return { error: "视频生成失败", detail: qd.data };
-      }
-    }
-    return { error: "视频生成超时，可稍后用 query_result 查询 submit_id=" + submitId };
+    if (!submitId) return JSON.stringify({ error: "视频任务提交失败", detail: sd });
+    if (ctx.chatId) startDreaminaBackgroundPoll(submitId, ctx.chatId, label);
+    return JSON.stringify({
+      status: "submitted",
+      engine: "dreamina",
+      submit_id: submitId,
+      message: `🎬 视频已提交，后台轮询中，完成后自动推送 ⏳`,
+    });
   }
 
   // ── IMAGE via Dreamina ─────────────────────────────────────────────────────
