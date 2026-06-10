@@ -2,6 +2,14 @@ import "dotenv/config";
 import express from "express";
 import Anthropic from "@anthropic-ai/sdk";
 import * as lark from "@larksuiteoapi/node-sdk";
+import { exec as execRaw } from "child_process";
+import { promisify } from "util";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const execCmd = promisify(execRaw);
 
 const app = express();
 app.use(express.json());
@@ -329,6 +337,43 @@ async function atypicaExec(args) {
     return await res.json();
   } catch (err) {
     return { error: `Atypica 代理连接失败: ${err.message}` };
+  }
+}
+
+// FFmpeg + Remotion — run directly on Railway (installed via nixpacks.toml)
+const WORK_DIR = "/tmp/jw2work";
+
+async function ensureWorkDir() {
+  await execCmd(`mkdir -p "${WORK_DIR}"`).catch(() => {});
+}
+
+async function runFfmpegExec(command) {
+  if (!command.trimStart().startsWith("ffmpeg")) {
+    return { error: "命令必须以 ffmpeg 开头，禁止执行其他命令" };
+  }
+  await ensureWorkDir();
+  try {
+    const { stdout, stderr } = await execCmd(command, { cwd: WORK_DIR, timeout: 120000 });
+    return { ok: true, stdout: stdout.slice(0, 2000), stderr: stderr.slice(0, 500) };
+  } catch (err) {
+    return { error: err.message.slice(0, 2000) };
+  }
+}
+
+async function runRemotionExec(compositionId, outputPath, props) {
+  if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(compositionId)) {
+    return { error: "compositionId 格式非法" };
+  }
+  await ensureWorkDir();
+  const absOut = outputPath.startsWith("/") ? outputPath : path.join(WORK_DIR, outputPath);
+  const renderScript = path.join(__dirname, "remotion-render.mjs");
+  const propsArg = props ? JSON.stringify(props) : "{}";
+  const cmd = `node "${renderScript}" "${compositionId}" "${absOut}" '${propsArg.replace(/'/g, "'\\''")}'`;
+  try {
+    const { stdout, stderr } = await execCmd(cmd, { cwd: __dirname, timeout: 180000 });
+    return { ok: true, outputPath: absOut, stdout: stdout.slice(0, 1000) };
+  } catch (err) {
+    return { error: err.message.slice(0, 2000) };
   }
 }
 
@@ -1133,6 +1178,84 @@ const tools = [
     },
   },
   {
+    name: "write_workdir_file",
+    description: `向 /tmp/jw2work/ 写入小型文本文件（如 ffmpeg concat list.txt、filter 脚本等）。
+仅支持纯文本内容，路径不能包含 ../ 或绝对路径前缀。
+示例：filename="list.txt", content="file 'clip1.mp4'\nfile 'clip2.mp4'\n"`,
+    input_schema: {
+      type: "object",
+      properties: {
+        filename: {
+          type: "string",
+          description: "文件名（不含目录），如 list.txt",
+        },
+        content: {
+          type: "string",
+          description: "文本内容（\\n 换行）",
+        },
+      },
+      required: ["filename", "content"],
+    },
+  },
+  {
+    name: "run_ffmpeg",
+    description: `在服务器上执行 FFmpeg 命令，用于视频拼接、转场、加字幕、格式转换等。
+工作目录：/tmp/jw2work/（所有输入/输出文件都放在这里）
+常用示例：
+- 拼接多段视频（concat）: "ffmpeg -f concat -safe 0 -i list.txt -c copy output.mp4"
+  list.txt 格式：每行 "file 'clip1.mp4'"
+- xfade 转场（两段淡入）: "ffmpeg -i a.mp4 -i b.mp4 -filter_complex \\"[0][1]xfade=transition=fade:duration=0.5:offset=3\\" out.mp4"
+- drawtext 字幕: "ffmpeg -i input.mp4 -vf \\"drawtext=text='品牌名':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=h-100\\" output.mp4"
+- 提取音频: "ffmpeg -i input.mp4 -vn -acodec copy audio.aac"
+- 添加背景音乐: "ffmpeg -i video.mp4 -i music.mp3 -filter_complex amix=inputs=2 out.mp4"
+- 格式转换/压缩: "ffmpeg -i input.mp4 -vcodec libx264 -crf 23 output.mp4"
+注意：命令必须以 ffmpeg 开头；文件路径使用相对路径（相对 /tmp/jw2work/）或绝对路径。`,
+    input_schema: {
+      type: "object",
+      properties: {
+        command: {
+          type: "string",
+          description: "完整 ffmpeg 命令，必须以 ffmpeg 开头",
+        },
+      },
+      required: ["command"],
+    },
+  },
+  {
+    name: "run_remotion",
+    description: `使用 Remotion（React 动画引擎）渲染动画片段，用于标题卡、文字动画、品牌片头等。
+可用 Composition：
+- TitleCard: 品牌标题卡（淡入 + 上升动画），适合片头/片尾
+  props: { brand, tagline, bgColor, textColor, accentColor }
+- TextOverlay: 文字叠加层（底部/顶部滑入），适合字幕/说明
+  props: { lines: string[], position: "bottom"|"top", bgColor, textColor, fontSize }
+输出路径：相对路径放在 /tmp/jw2work/ 下，例如 "title.mp4"
+示例：渲染品牌片头 → compositionId="TitleCard", outputPath="title.mp4", props={"brand":"九阳","tagline":"好生活"}`,
+    input_schema: {
+      type: "object",
+      properties: {
+        compositionId: {
+          type: "string",
+          description: "Composition 名称：TitleCard 或 TextOverlay",
+          enum: ["TitleCard", "TextOverlay"],
+        },
+        outputPath: {
+          type: "string",
+          description: "输出文件名（相对 /tmp/jw2work/），如 title.mp4",
+        },
+        props: {
+          type: "object",
+          description: "传入 Composition 的 props，如 {\"brand\":\"品牌名\",\"tagline\":\"标语\"}",
+        },
+        durationInFrames: {
+          type: "number",
+          description: "时长（帧数），30fps，默认 90（3秒）",
+        },
+      },
+      required: ["compositionId", "outputPath"],
+    },
+  },
+  {
     name: "get_hot_topics",
     description: `获取国内各大平台的实时热榜。支持平台：
 - weibo: 微博热搜
@@ -1929,6 +2052,22 @@ async function executeTool(name, input, ctx = {}) {
     }
     case "run_atypica":
       return JSON.stringify(await atypicaExec(input.args));
+    case "write_workdir_file": {
+      const fname = input.filename;
+      if (!fname || fname.includes("..") || fname.includes("/")) {
+        return JSON.stringify({ error: "非法文件名" });
+      }
+      await ensureWorkDir();
+      const { writeFile } = await import("fs/promises");
+      await writeFile(path.join(WORK_DIR, fname), input.content, "utf8");
+      return JSON.stringify({ ok: true, path: path.join(WORK_DIR, fname) });
+    }
+    case "run_ffmpeg":
+      return JSON.stringify(await runFfmpegExec(input.command));
+    case "run_remotion":
+      return JSON.stringify(
+        await runRemotionExec(input.compositionId, input.outputPath, input.props)
+      );
     case "get_hot_topics":
       return JSON.stringify(await hotTopicsExec(input.platform || "all", input.limit || 20));
     case "get_calendar_events":
@@ -2248,6 +2387,9 @@ function toolProgressMsg(name, input) {
   }
   if (name === "get_hot_topics") return "🔥 正在获取国内热榜...";
   if (name === "run_atypica")    return "📡 正在查询全球趋势...";
+  if (name === "write_workdir_file") return "📝 写入工作目录文件...";
+  if (name === "run_ffmpeg")     return "🎬 FFmpeg 处理视频...";
+  if (name === "run_remotion")   return "✨ Remotion 渲染动画...";
   if (name === "run_dreamina")             return "🎨 正在生成图像/视频...";
   if (name === "web_search")               return `🔍 正在搜索：${input?.query}`;
   if (name === "fetch_webpage")            return `🌐 正在读取网页：${input?.url?.slice(0, 60)}...`;
@@ -2648,6 +2790,38 @@ args=["api", "GET", "/open-apis/im/v1/messages",
   - 视频 → engine: "dreamina"（自动选 text2video 或 image2video）
 
   图片生成成功后直接告知用户；视频生成需轮询，完成后告知下载链接或结果。
+
+**视频后处理：run_ffmpeg + run_remotion（拼接与动画）**
+
+使用场景：视频片段已生成（Dreamina/Seedance），需要拼接、转场、加字幕、品牌片头/片尾。
+
+工作目录：/tmp/jw2work/  所有中间文件都放这里。
+
+【run_ffmpeg 常用模式】
+- 拼接多段视频：
+  1. 先写 list.txt（每行: file 'clip1.mp4'）
+  2. ffmpeg -f concat -safe 0 -i list.txt -c copy final.mp4
+- xfade 淡入转场（两段视频）：
+  ffmpeg -i a.mp4 -i b.mp4 -filter_complex "[0][1]xfade=transition=fade:duration=0.5:offset=3" out.mp4
+- drawtext 中文字幕（需 fontfile）：
+  ffmpeg -i input.mp4 -vf "drawtext=text='品牌':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=h-100" out.mp4
+- 混入背景音乐：
+  ffmpeg -i video.mp4 -i music.mp3 -filter_complex amix=inputs=2:duration=first out.mp4
+
+【run_remotion 使用模式】
+- TitleCard（品牌片头/片尾，3秒淡入）：
+  compositionId="TitleCard", outputPath="title.mp4", props={"brand":"九阳","tagline":"健康每一天","bgColor":"#1a1a2e","accentColor":"#e94560"}
+- TextOverlay（文字叠加字幕，透明底）：
+  compositionId="TextOverlay", outputPath="overlay.mp4", props={"lines":["主卖点标题","副说明文字"],"position":"bottom"}
+- 渲染完成后用 ffmpeg 叠加到主视频：
+  ffmpeg -i main.mp4 -i overlay.mp4 -filter_complex "[0:v][1:v]overlay=0:0" output.mp4
+
+【完整视频交付流程（有片头/字幕）】
+1. run_dreamina → 生成各个视频片段（存入 /tmp/jw2work/）
+2. run_remotion TitleCard → 生成品牌片头 title.mp4
+3. run_ffmpeg concat → 把片头 + 各片段拼接成 final.mp4
+4. （可选）run_remotion TextOverlay + ffmpeg overlay → 叠加字幕
+5. 上传 final.mp4，通过飞书消息交付给用户
 
 **第五优先级：web_search + fetch_webpage（互联网搜索与阅读）**
 
