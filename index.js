@@ -383,7 +383,7 @@ const ARK_VIDEO_BASE = "https://ark.cn-beijing.volces.com/api/v3";
 async function arkVideoSubmit({ prompt, duration = 5, ratio = "9:16" }) {
   const apiKey = process.env.SEEDANCE_ARK_KEY;
   if (!apiKey) return { error: "SEEDANCE_ARK_KEY 未配置" };
-  const modelId = process.env.SEEDANCE_MODEL_ID || "doubao-seedance-1-0-lite-t2v-250428";
+  const modelId = process.env.SEEDANCE_MODEL_ID || "seedance-2-0";
   try {
     const res = await fetch(`${ARK_VIDEO_BASE}/contents/generations/tasks`, {
       method: "POST",
