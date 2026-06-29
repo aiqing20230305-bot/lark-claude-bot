@@ -3,6 +3,8 @@ import express from "express";
 import Anthropic from "@anthropic-ai/sdk";
 import * as lark from "@larksuiteoapi/node-sdk";
 import { exec as execRaw } from "child_process";
+import { appendFile, mkdir } from "fs/promises";
+import os from "os";
 import { promisify } from "util";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -10,6 +12,76 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const execCmd = promisify(execRaw);
+const JINGWEI2_STATE_DIR = process.env.JINGWEI2_STATE_DIR || path.join(os.homedir(), ".claude", "jingwei2-states");
+const TASK_LEDGER_FILE = path.join(JINGWEI2_STATE_DIR, "task-ledger.jsonl");
+const WEBHOOK_REPLAY_MODE = process.env.JINGWEI2_WEBHOOK_REPLAY_MODE === "1";
+
+function envDelayMs(msName, secondsName, fallbackMs) {
+  const directMs = Number(process.env[msName] || "");
+  if (Number.isFinite(directMs) && directMs >= 0) return directMs;
+  const seconds = Number(process.env[secondsName] || "");
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  return fallbackMs;
+}
+
+const RESPONSE_LADDER_DISABLED = process.env.JINGWEI2_DISABLE_RESPONSE_LADDER === "1";
+const RESPONSE_LADDER_FIRST_DELAY_MS = envDelayMs(
+  "JINGWEI2_RESPONSE_LADDER_FIRST_DELAY_MS",
+  "JINGWEI2_RESPONSE_LADDER_FIRST_DELAY",
+  3000
+);
+const RESPONSE_LADDER_SECOND_DELAY_MS = Math.max(
+  envDelayMs("JINGWEI2_RESPONSE_LADDER_SECOND_DELAY_MS", "JINGWEI2_RESPONSE_LADDER_SECOND_DELAY", 8000),
+  RESPONSE_LADDER_FIRST_DELAY_MS + 1
+);
+const RESPONSE_LADDER_THIRD_DELAY_MS = Math.max(
+  envDelayMs("JINGWEI2_RESPONSE_LADDER_THIRD_DELAY_MS", "JINGWEI2_RESPONSE_LADDER_THIRD_DELAY", 20000),
+  RESPONSE_LADDER_SECOND_DELAY_MS + 1
+);
+const RESPONSE_LADDER_FOURTH_DELAY_MS = Math.max(
+  envDelayMs("JINGWEI2_RESPONSE_LADDER_FOURTH_DELAY_MS", "JINGWEI2_RESPONSE_LADDER_FOURTH_DELAY", 45000),
+  RESPONSE_LADDER_THIRD_DELAY_MS + 1
+);
+const TASK_PRE_ACK_ENABLED = process.env.JINGWEI2_TASK_PRE_ACK_ENABLED !== "0";
+const TASK_PRE_ACK_SEND_TIMEOUT_MS = envDelayMs(
+  "JINGWEI2_TASK_PRE_ACK_SEND_TIMEOUT_MS",
+  "JINGWEI2_TASK_PRE_ACK_SEND_TIMEOUT",
+  2000
+);
+
+function senderSessionKey(chatId, senderOpenId) {
+  return `chat:${chatId || "missing_chat"}:sender:${senderOpenId || "unknown_sender"}`;
+}
+
+function previewForLedger(value, max = 160) {
+  let text = "";
+  if (typeof value === "string") {
+    text = value;
+  } else if (Array.isArray(value)) {
+    text = value
+      .filter(block => block?.type === "text")
+      .map(block => block.text || "")
+      .join(" ");
+    if (!text) text = "[media message]";
+  } else if (value) {
+    text = "[structured message]";
+  }
+  return text.replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+async function appendTaskLedger(event, fields = {}) {
+  const row = {
+    event,
+    ts: new Date().toISOString(),
+    ...fields,
+  };
+  try {
+    await mkdir(JINGWEI2_STATE_DIR, { recursive: true });
+    await appendFile(TASK_LEDGER_FILE, `${JSON.stringify(row)}\n`, "utf8");
+  } catch (err) {
+    console.error("[task-ledger] 写入失败", event, err.message);
+  }
+}
 
 const app = express();
 app.use(express.json());
@@ -379,18 +451,41 @@ async function runRemotionExec(compositionId, outputPath, props) {
 
 // ── Seedance via ByteDance Ark API（直连，不经过本地代理）──────────────────────
 const ARK_VIDEO_BASE = "https://ark.cn-beijing.volces.com/api/v3";
+const VIDEO_RATIO_MAP = { "1:1": "1:1", "16:9": "16:9", "9:16": "9:16", "4:3": "4:3", "3:4": "3:4" };
 
-async function arkVideoSubmit({ prompt, duration = 5, ratio = "9:16" }) {
-  const apiKey = process.env.SEEDANCE_ARK_KEY;
-  if (!apiKey) return { error: "SEEDANCE_ARK_KEY 未配置" };
-  const modelId = process.env.SEEDANCE_MODEL_ID || "seedance-2-0";
+function normalizeVideoRatio(ratio = "9:16") {
+  return VIDEO_RATIO_MAP[ratio] || "9:16";
+}
+
+function normalizeVideoDuration(duration = 5) {
+  const n = Number(duration) || 5;
+  return Math.min(Math.max(Math.round(n), 4), 15);
+}
+
+function enforceVideoPromptConstraints(prompt, ratio) {
+  const ratioText = ratio === "9:16"
+    ? "vertical 9:16 portrait video, 720p, mobile-first composition, no horizontal framing"
+    : `${ratio} video composition, 720p`;
+  return `${prompt}\n\nTechnical requirements: ${ratioText}. Keep all important subjects inside the ${ratio} safe frame.
+Quality requirements: one clear hero subject, one readable action, stable cinematic camera movement, natural realistic motion, commercial lighting, premium texture, no unreadable AI text, no random logos, no warped faces, no distorted product shape.`;
+}
+
+async function arkVideoSubmit({ prompt, duration = 5, ratio = "9:16", referenceImageUrl = "" }) {
+  const apiKey = process.env.SEEDANCE_ARK_KEY || process.env.ARK_API_KEY;
+  if (!apiKey) return { error: "SEEDANCE_ARK_KEY/ARK_API_KEY 未配置" };
+  const modelId = process.env.SEEDANCE_MODEL_ID || "doubao-seedance-2-0-260128";
+  const content = [];
+  if (referenceImageUrl) {
+    content.push({ type: "image_url", image_url: { url: referenceImageUrl } });
+  }
+  content.push({ type: "text", text: prompt });
   try {
     const res = await fetch(`${ARK_VIDEO_BASE}/contents/generations/tasks`, {
       method: "POST",
       headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: modelId,
-        content: [{ type: "text", text: prompt }],
+        content,
         parameters: { duration, ratio },
       }),
     });
@@ -403,8 +498,8 @@ async function arkVideoSubmit({ prompt, duration = 5, ratio = "9:16" }) {
 }
 
 async function arkVideoQuery(taskId) {
-  const apiKey = process.env.SEEDANCE_ARK_KEY;
-  if (!apiKey) return { error: "SEEDANCE_ARK_KEY 未配置" };
+  const apiKey = process.env.SEEDANCE_ARK_KEY || process.env.ARK_API_KEY;
+  if (!apiKey) return { error: "SEEDANCE_ARK_KEY/ARK_API_KEY 未配置" };
   try {
     const res = await fetch(`${ARK_VIDEO_BASE}/contents/generations/tasks/${taskId}`, {
       headers: { "Authorization": `Bearer ${apiKey}` },
@@ -413,6 +508,21 @@ async function arkVideoQuery(taskId) {
   } catch (err) {
     return { error: `查询失败: ${err.message}` };
   }
+}
+
+function extractArkVideoUrl(result) {
+  const content = result?.content;
+  if (Array.isArray(content)) {
+    const video = content.find(item => item?.type === "video");
+    return video?.video_url || video?.url || "";
+  }
+  if (content && typeof content === "object") {
+    return content.video_url || content.url || "";
+  }
+  if (result?.result && typeof result.result === "object") {
+    return result.result.video_url || result.result.url || "";
+  }
+  return result?.video_url || "";
 }
 
 // 后台轮询：任务完成后主动推送飞书消息（不阻塞 agent loop）
@@ -431,8 +541,7 @@ function startVideoBackgroundPoll(taskId, chatId, label, queryFn) {
       const status = r?.status;
       if (status === "succeeded") {
         clearInterval(handle);
-        const videoUrl = r?.content?.find?.(c => c.type === "video")?.video_url
-          || r?.video_url || r?.result?.video_url || "（请查看 task_id）";
+        const videoUrl = extractArkVideoUrl(r) || "（请查看 task_id）";
         sendMessage(chatId, `✅ 「${label}」渲染完成！\n🎬 ${videoUrl}`).catch(() => {});
       } else if (status === "failed") {
         clearInterval(handle);
@@ -471,6 +580,146 @@ function startDreaminaBackgroundPoll(submitId, chatId, label) {
       console.error("[DreaminaBackgroundPoll] error:", submitId, err.message);
     }
   }, 30_000);
+}
+
+async function submitVideoProject(plan, ctx = {}) {
+  const projectTitle = plan.project_title || plan.project || plan.title || "未命名视频项目";
+  const aspectRatio = normalizeVideoRatio(plan.aspect_ratio || plan.ratio || "9:16");
+  const defaultEngine = plan.engine || "seedance";
+  const dryRun = !!plan.dry_run;
+  const scenes = Array.isArray(plan.scenes) ? plan.scenes.slice(0, 8) : [];
+  const projectId = `vproj_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const results = [];
+
+  if (scenes.length === 0) {
+    return { ok: false, error: "scenes 不能为空" };
+  }
+
+  for (let i = 0; i < scenes.length; i++) {
+    const scene = scenes[i] || {};
+    const sceneId = scene.scene_id || `scene_${i + 1}`;
+    const sceneLabel = scene.label || scene.title || sceneId;
+    const label = `${projectTitle} · ${sceneLabel}`.slice(0, 60);
+    const sceneType = scene.scene_type || scene.type || "video";
+
+    if (sceneType !== "video") {
+      results.push({
+        scene_id: sceneId,
+        label: sceneLabel,
+        scene_type: sceneType,
+        status: "not_submitted",
+        reason: "该镜头标记为静态/既有素材，不提交视频渲染任务",
+      });
+      continue;
+    }
+
+    const promptSource = scene.prompt_en || scene.prompt || scene.prompt_zh || scene.description;
+    if (!promptSource) {
+      results.push({
+        scene_id: sceneId,
+        label: sceneLabel,
+        scene_type: sceneType,
+        status: "failed",
+        error: "缺少 prompt_en/prompt，未提交",
+      });
+      continue;
+    }
+
+    const duration = normalizeVideoDuration(scene.duration || plan.default_duration || 5);
+    const ratio = normalizeVideoRatio(scene.aspect_ratio || aspectRatio);
+    const referenceGuard = scene.reference_image_url
+      ? "Preserve the identity, pose logic, key colors, and product/person features from the reference image."
+      : "";
+    const notes = scene.notes ? `QC notes: ${scene.notes}` : "";
+    const prompt = enforceVideoPromptConstraints([promptSource, referenceGuard, notes].filter(Boolean).join("\n"), ratio);
+    const engine = scene.engine || defaultEngine;
+
+    if (dryRun) {
+      results.push({
+        scene_id: sceneId,
+        label: sceneLabel,
+        status: "dry_run",
+        engine,
+        duration,
+        aspect_ratio: ratio,
+        prompt_preview: prompt.slice(0, 1000),
+      });
+      continue;
+    }
+
+    try {
+      if (engine !== "seedance") {
+        results.push({
+          scene_id: sceneId,
+          label: sceneLabel,
+          status: "failed",
+          engine,
+          error: "视频项目提交只允许使用可追踪 task_id 的 seedance-ark；Dreamina text2video 当前无法稳定返回 submit_id",
+        });
+        continue;
+      }
+
+      {
+        const submitResult = await arkVideoSubmit({
+          prompt,
+          duration,
+          ratio,
+          referenceImageUrl: scene.reference_image_url,
+        });
+        if (submitResult.error || !submitResult.task_id) {
+          results.push({
+            scene_id: sceneId,
+            label: sceneLabel,
+            status: "failed",
+            engine: "seedance-ark",
+            error: submitResult.error || "Ark API 未返回 task_id",
+            detail: submitResult,
+          });
+          continue;
+        }
+        if (ctx.chatId) startVideoBackgroundPoll(submitResult.task_id, ctx.chatId, label, arkVideoQuery);
+        results.push({
+          scene_id: sceneId,
+          label: sceneLabel,
+          status: "submitted",
+          engine: "seedance-ark",
+          task_id: submitResult.task_id,
+          duration,
+          aspect_ratio: ratio,
+        });
+        continue;
+      }
+    } catch (err) {
+      results.push({
+        scene_id: sceneId,
+        label: sceneLabel,
+        status: "failed",
+        error: err.message,
+      });
+    }
+  }
+
+  const submitted = results.filter(r => r.status === "submitted").length;
+  const failed = results.filter(r => r.status === "failed").length;
+  const notSubmitted = results.filter(r => r.status === "not_submitted").length;
+  const dryRunCount = results.filter(r => r.status === "dry_run").length;
+  return {
+    ok: failed === 0 && (submitted > 0 || dryRunCount > 0),
+    project_id: projectId,
+    project_title: projectTitle,
+    aspect_ratio: aspectRatio,
+    dry_run: dryRun,
+    submitted,
+    dry_run_scenes: dryRunCount,
+    failed,
+    not_submitted: notSubmitted,
+    message: submitted > 0
+      ? `已真实提交 ${submitted} 个视频镜头，后台轮询会在完成后推送结果。静态镜头不会显示为渲染中。`
+      : dryRunCount > 0
+      ? `Dry run 通过：${dryRunCount} 个视频镜头会被提交，${notSubmitted} 个静态/既有素材镜头不会进入渲染。`
+      : "没有视频镜头被提交，请检查 scenes 中的 scene_type 和 prompt_en。",
+    scenes: results,
+  };
 }
 
 // Chinese hot topics via local proxy
@@ -697,8 +946,407 @@ async function sendDirectMessage(openId, text) {
   return data.code === 0 ? "消息发送成功" : `发送失败: ${data.msg}`;
 }
 
+function plainTextFromUserContent(userContent) {
+  if (typeof userContent === "string") return userContent;
+  if (Array.isArray(userContent)) {
+    return userContent
+      .filter(item => item?.type === "text")
+      .map(item => item.text || "")
+      .join(" ")
+      .trim();
+  }
+  return "";
+}
+
+function sanitizeUserVisibleText(value) {
+  return String(value || "")
+    .replace(/\b(sender_open_id|sender_session_key|request_message_id|source_message_id|original_message_id|reply_message_id|message_id|open_id|chat_id|taskKey|ledger|task-ledger)\b[:：]?\s*[A-Za-z0-9_:-]*/gi, "相关信息")
+    .replace(/\b(om|oc|ou)_[A-Za-z0-9_-]{6,}\b/g, "相关信息")
+    .replace(/(?:\/Users|\/private|\/tmp|tmp\/jw2-assets)\/[^\s，。；、)）]+/g, "相关文件")
+    .replace(/\b(node scripts|npm run|lark-cli|--chat-id|--message|--output|--ledger-jsonl)\b[^\n，。；]*/gi, "后台检查")
+    .replace(/\b(status|phase|schema|workflow)\s*[:=]\s*[A-Za-z0-9_.:-]+/gi, "状态已记录")
+    .replace(/[ \t]+$/gm, "")
+    .trim();
+}
+
+function userVisibleRequestPreview(userContent) {
+  const raw = plainTextFromUserContent(userContent).replace(/\s+/g, " ").trim();
+  if (!raw) return "你发来的素材/需求";
+  if (/https?:\/\/|applink\.feishu\.cn|feishu\.cn/i.test(raw)) return "你发来的链接和资料";
+  return sanitizeUserVisibleText(raw).slice(0, 80) || "你发来的素材/需求";
+}
+
+function isExplicitNonVideoCorrectionText(text) {
+  const compact = String(text || "").replace(/\s+/g, "");
+  if (!compact) return false;
+  return (
+    /(?:不是|不属于|并不是|并非|没关系|无关)(?:.*)(?:视频|成片|剪辑|Seedance|seedance|生成视频|视频生成)/.test(compact)
+    || /(?:视频|成片|剪辑|Seedance|seedance|生成视频|视频生成)(?:.*)(?:没关系|无关|不是|不属于|并非)/.test(compact)
+    || /(?:不需要视频|不用视频|不要视频)/.test(compact)
+  );
+}
+
+function looksLikeContentOpsLookupText(text) {
+  const compact = String(text || "");
+  const business = /内容运营|运营表|运营排期|内容表|排期表|Backlog|backlog|多维表|表格|Base|base|数据表|飞书表|去年|历史/.test(compact);
+  const lookup = /搜|搜索|查|查询|找|看看|看下|核对|对一下/.test(compact);
+  return business && lookup;
+}
+
+function routeHumanPhrase(route = {}) {
+  const label = route.label || "";
+  if (/视频|剪辑/.test(label)) return "视频这条线";
+  if (/PPT|汇报/.test(label)) return "PPT这条线";
+  if (/飞书/.test(label)) return "飞书资料这条线";
+  if (/图片|视觉/.test(label)) return "视觉这条线";
+  if (/内容运营|策略/.test(label)) return "内容运营这条线";
+  return "这个问题";
+}
+
+function compactRouteAction(route = {}) {
+  return sanitizeUserVisibleText(route.nextAction || route.secondState || route.firstAction || "我先给你一版能确认的方向。");
+}
+
+function hasExplicitExecutionConsent(text) {
+  const compact = String(text || "");
+  if (/不要生成|别生成|不消耗|不要消耗|不要执行|no-spend|no spend/i.test(compact)) return false;
+  return /确认执行|可以执行|开始执行|直接开始|直接生成|开始生成|不用问|不用确认|按这个执行|按计划执行|就按这个来|同意|确认可以|可以生成|开跑|CONFIRM_SEND_TO_FEISHU/i.test(compact);
+}
+
+function isTaskLikeText(text) {
+  const compact = String(text || "").trim();
+  if (!compact) return false;
+  if (/你能做什么|能做什么|怎么用|可以做什么|怎么跟你聊/.test(compact)) return false;
+  return /帮我|生成|制作|输出|写一个|做一个|整理|读取|分析|转成|发到|上传|链接|https?:\/\/|飞书文档|base|表格|任务|ppt|PPT|deck|视频|成片|剪辑|脚本|素材/.test(compact);
+}
+
+function isLightweightInteractionText(text) {
+  const compact = String(text || "").trim();
+  if (!compact || compact.length > 120) return false;
+  if (hasExplicitExecutionConsent(compact)) return false;
+  if (isTaskLikeText(compact)) return false;
+  return /在吗|在不在|你好|嗨|hi|hello|hey|你是谁|你是啥|你能做什么|能做什么|怎么用|可以做什么|怎么跟你聊|谢谢|谢了|辛苦|收到没|慢|太慢|反应慢|回复慢|没反应|互动|像经纬|口吻|语气/i.test(compact);
+}
+
+function buildJingweiInstantReply(text) {
+  const compact = String(text || "").trim();
+  if (/慢|反应慢|回复慢|没反应|互动/.test(compact)) {
+    return "对，这个体验不能慢。\n我会先回一句把事接住，再边做边把能确定的先抛出来；真卡住就直接说卡在哪。你补一句限制或改法，我会并进这轮。";
+  }
+  if (/像经纬|口吻|语气/.test(compact)) {
+    return "明白，我按经纬的方式说：少铺垫，先给判断，能往前推就往前推。\n你把目标、素材、限制丢过来就行；我只问影响结果的关键点，其他我来拆。";
+  }
+  if (/你是谁|你是啥/.test(compact)) {
+    return "我是经纬2号，经纬的数字分身。\n你把视频、PPT、飞书链接或内容运营需求发来，我负责拆 brief、选路线、推进到可交付结果。";
+  }
+  if (/你能做什么|能做什么|怎么用|可以做什么|怎么跟你聊/.test(compact)) {
+    return "你直接把目标、素材、限制丢给我就行。\n我会先听懂你到底要什么，能做就往前推；需要你拍板的地方，我只问一句关键的。";
+  }
+  if (/在吗|在不在|你好|嗨|hi|hello|hey|收到没/i.test(compact)) {
+    return "在，我是经纬2号。\n你直接说想要什么结果，我先接住，再给你下一步。";
+  }
+  if (/谢谢|谢了|辛苦/.test(compact)) {
+    return "不客气，继续把要改的点直接发我，我会接到当前任务里。";
+  }
+  return "我在。你直接说目标，我来替你拆下一步。";
+}
+
+const JINGWEI_BOT_MENTION_PATTERNS = [
+  /经纬\s*2号/i,
+  /经维\s*2号/i,
+  /经纬二号/i,
+  /智能体/i,
+  /jingwei\s*2/i,
+  /jingwei2/i,
+  /\bjw2\b/i,
+];
+
+function textLooksLikeJingweiBotName(value = "") {
+  const compact = String(value || "").trim();
+  if (!compact) return false;
+  return JINGWEI_BOT_MENTION_PATTERNS.some(pattern => pattern.test(compact));
+}
+
+function messageMentionsJingweiBot(message = {}) {
+  const mentions = Array.isArray(message.mentions) ? message.mentions : [];
+  if (mentions.some(mention => {
+    const mentionId = mention?.id || {};
+    if (botOpenId && mentionId?.open_id === botOpenId) return true;
+    return [
+      mention?.name,
+      mention?.text,
+      mention?.key && textLooksLikeJingweiBotName(mention.key) ? mention.key : "",
+    ].some(textLooksLikeJingweiBotName);
+  })) {
+    return true;
+  }
+
+  let text = "";
+  try {
+    const content = typeof message.content === "string" ? JSON.parse(message.content) : message.content;
+    text = content?.text || "";
+  } catch {
+    text = String(message.content || "");
+  }
+  return /@\s*(经纬\s*2号|经维\s*2号|经纬二号|智能体|jingwei\s*2|jingwei2|jw2)(?:\s|[:：，,]|$)/i.test(text);
+}
+
+function stripJingweiBotMentionText(text = "") {
+  return String(text || "")
+    .replace(/@\s*(经纬\s*2号|经维\s*2号|经纬二号|智能体|jingwei\s*2|jingwei2|jw2)[\s:：，,]*/gi, "")
+    .replace(/@[^\s]+\s*/g, "")
+    .trim();
+}
+
+function buildJingweiAckContent(userContent, messageId = "") {
+  const route = inferResponseRouteForUser(userContent);
+  const preview = userVisibleRequestPreview(userContent);
+  return sanitizeUserVisibleText([
+    `收到，我先看你这条：${preview}`,
+    `我先按${routeHumanPhrase(route)}往下拆，先给你一版能确认的方向。`,
+    `如果有硬限制，直接补一句；要我加速，就回「${route.fastPhrase}」。`,
+    "如果这轮要多等一下，我会直接说清楚卡在哪，不让你干等。",
+  ].filter(Boolean).join("\n"));
+}
+
+function buildJingweiTaskPreAckText(userContent, queued = false) {
+  const route = inferResponseRouteForUser(userContent);
+  if (queued) {
+    return sanitizeUserVisibleText("收到，这句我合到当前这轮里，不另开。你有硬限制继续补，我接着往下推。");
+  }
+  return sanitizeUserVisibleText(`收到，我先看。这个我先按${routeHumanPhrase(route)}接住；你有硬限制直接补一句，我会并进去。`);
+}
+
+function inferResponseRouteForUser(userContent) {
+  const text = plainTextFromUserContent(userContent);
+  const compact = String(text || "").toLowerCase();
+  if (looksLikeContentOpsLookupText(text)) {
+    return {
+      label: "内容运营/资料查询",
+      firstAction: "先查内容运营相关表和可见上下文，确认是不是拿错了旧表，再给你结论和下一步。",
+      supplement: "补表名、时间范围、客户/项目名、只读还是允许更新，或直接说先查内容运营表。",
+      secondState: "我会把查到的表、时间范围、差异点和下一步动作说清楚。",
+      confirmation: "先只读核对，还是允许我整理成更新建议。",
+      nextAction: "先给你查表结论和差异点；需要写入前会单独问你。",
+      fastPhrase: "先查内容运营表",
+    };
+  }
+  if (isExplicitNonVideoCorrectionText(text)) {
+    return {
+      label: "问题纠偏/资料查证",
+      firstAction: "先把这轮从视频路线拉回来，回到你刚才真正的问题上查上下文和资料。",
+      supplement: "补一句你要我回到哪个表、哪条消息或哪份资料，我就沿那条线查。",
+      secondState: "我会先说明前面哪里带偏了，再给你新的判断和下一步。",
+      confirmation: "回到刚才的问题查资料，还是直接让我给一版修正结论。",
+      nextAction: "先回到原问题，不进入视频生成、剪辑或额度流程。",
+      fastPhrase: "回到刚才问题",
+    };
+  }
+  if (/视频|成片|剪辑|脚本|分镜|镜头|口播|字幕|bgm|seedance|hyperframes|remotion/.test(compact)) {
+    return {
+      label: "视频/剪辑任务",
+      firstAction: "先把目标、脚本分段、镜头画面、素材来源、比例和交付形态拆开；有脚本时优先用画面卡对齐，不把大段文字直接塞进视频。",
+      supplement: "补时长、比例、参考风格、必须出现/不能出现的内容，或直接说先出分镜。",
+      secondState: "我会先产出可确认的脚本/分镜/画面段落，再判断走生成、剪辑还是包装。",
+      confirmation: "先看分镜确认，还是直接进入成片路线。",
+      nextAction: "先给你可确认的脚本分段和镜头建议；涉及生成额度前会停下来问你。",
+      fastPhrase: "按这个方向先出分镜",
+    };
+  }
+  if (/ppt|deck|幻灯片|演示|提案|汇报/.test(compact)) {
+    return {
+      label: "PPT/汇报任务",
+      firstAction: "先拆受众、目的、页数、信息层级和可复用素材，再决定是先出大纲还是直接生成页面。",
+      supplement: "补页数、场景、客户、风格、已有资料链接，或说先给目录。",
+      secondState: "我会把内容拆成封面、核心观点、论证页、案例/数据页和收口页。",
+      confirmation: "先确认目录逻辑，还是直接做成可编辑稿。",
+      nextAction: "先给你可改的大纲和页面结构，再进入生成/上传。",
+      fastPhrase: "先按这个做目录",
+    };
+  }
+  if (/内容运营|运营表|运营排期|内容表|backlog|Backlog|选题|热点|投放|案例/.test(compact)) {
+    return {
+      label: "内容运营/资料查询",
+      firstAction: "先查内容运营相关表和可见上下文，确认是不是拿错了旧表，再给你结论和下一步。",
+      supplement: "补表名、时间范围、客户/项目名、只读还是允许更新，或直接说先查内容运营表。",
+      secondState: "我会把查到的表、时间范围、差异点和下一步动作说清楚。",
+      confirmation: "先只读核对，还是允许我整理成更新建议。",
+      nextAction: "先给你查表结论和差异点；需要写入前会单独问你。",
+      fastPhrase: "先查内容运营表",
+    };
+  }
+  if (/飞书|文档|云文档|表格|base|多维表格|链接|群聊|消息|知识库|wiki/.test(compact)) {
+    return {
+      label: "飞书资料/协作任务",
+      firstAction: "先识别链接或上下文属于文档、表格、群聊还是知识库，再做读取、归纳或写入计划。",
+      supplement: "补目标结果、目标文档/表格、是否允许写入，或只让我先读和总结。",
+      secondState: "我会先把已读到的信息、缺口和可执行动作列清楚，写入类操作会等你确认。",
+      confirmation: "只读总结，还是允许我进入更新/创建。",
+      nextAction: "先给你结论和缺口，再把需要确认的动作单独列出来。",
+      fastPhrase: "先只读总结",
+    };
+  }
+  if (/图片|海报|视觉|封面|配图|素材|参考图|image|logo/.test(compact)) {
+    return {
+      label: "图片/视觉任务",
+      firstAction: "先拆主体、用途、画幅、风格和参考约束，再判断是生成、改图还是做素材包。",
+      supplement: "补参考图、品牌色、画幅、不能出现的元素，或说先给三版方向。",
+      secondState: "我会先给你视觉方向和提示词结构，再决定是否进入生成。",
+      confirmation: "先看方向，还是直接生成样图。",
+      nextAction: "先把画面方向和关键约束列清楚；生成前会确认。",
+      fastPhrase: "先给三版方向",
+    };
+  }
+  if (/内容|运营|小红书|抖音|tiktok|矩阵|账号/.test(compact)) {
+    return {
+      label: "内容运营/策略任务",
+      firstAction: "先看目标用户、平台、内容形态和可执行产物，再把选题、脚本或排期拆出来。",
+      supplement: "补平台、品牌、目标人群、周期、参考账号，或说先出第一周执行包。",
+      secondState: "我会把判断、产物结构和优先级拆开，避免只给空泛建议。",
+      confirmation: "先要策略判断，还是直接要选题/脚本/排期。",
+      nextAction: "先给你能落地的一版结构，再继续扩成执行清单。",
+      fastPhrase: "先出执行包",
+    };
+  }
+  return {
+    label: "综合任务",
+    firstAction: "先看你要的是信息整理、内容生成、飞书操作还是交付物制作，再选最短执行路线。",
+    supplement: "补目标、限制、素材、截止时间，或直接说你最想先看到什么。",
+    secondState: "我会把已确定、待确认、下一步动作分开，避免让你等一段时间只得到一句泛泛回复。",
+    confirmation: "先给判断路线，还是直接进入产物草稿。",
+    nextAction: "先给可确认的路线和第一版结果；需要你定的地方只问关键点。",
+    fastPhrase: "先给路线",
+  };
+}
+
+function buildJingweiResponseLadderContent(phase, userContent) {
+  const route = inferResponseRouteForUser(userContent);
+  if (phase === "fourth") {
+    return {
+      title: "经纬2号 · 下一步很明确",
+      color: "orange",
+      content: sanitizeUserVisibleText([
+        `这轮我已经按${routeHumanPhrase(route)}往下推了。`,
+        `差你拍板的话，就集中在这一句：${route.confirmation}`,
+        `你确认我就继续做；要改，直接丢修改点，我合进当前任务。`,
+      ].join("\n")),
+    };
+  }
+  if (phase === "third") {
+    return {
+      title: "经纬2号 · 我把要你定的点拎出来",
+      color: "orange",
+      content: sanitizeUserVisibleText([
+        `方向我先按${routeHumanPhrase(route)}走。`,
+        `现在最需要你定的是：${route.confirmation}`,
+        `不定也没关系，我先给可改版本；你回「${route.fastPhrase}」会更快。`,
+      ].join("\n")),
+    };
+  }
+  if (phase === "second") {
+    return {
+      title: "经纬2号 · 我先把方向往前推",
+      color: "orange",
+      content: sanitizeUserVisibleText([
+        `我已经开始按${routeHumanPhrase(route)}拆了，先不让你空等。`,
+        compactRouteAction(route),
+        `你想让我直接走这条路，就回「${route.fastPhrase}」。`,
+      ].join("\n")),
+    };
+  }
+  return {
+    title: "经纬2号 · 我先接住",
+    color: "yellow",
+    content: sanitizeUserVisibleText([
+      `我先按${routeHumanPhrase(route)}看。`,
+      "你不用补很多背景，我会先拆出一版能确认的方向。",
+      `如果有硬限制，现在直接补一句就行。`,
+    ].join("\n")),
+  };
+}
+
+function clearResponseLadderTimers(taskKey) {
+  const task = taskKey ? activeTasks.get(taskKey) : null;
+  const timers = Array.isArray(task?.responseLadderTimers) ? task.responseLadderTimers : [];
+  for (const timer of timers) clearTimeout(timer);
+  if (task) task.responseLadderTimers = [];
+}
+
+async function sendResponseLadderUpdate({ phase, taskKey, chatId, progressCardId, msgId, userContent, ledgerBase }) {
+  const task = activeTasks.get(taskKey);
+  if (!task || task.sourceMessageId !== msgId) return false;
+  if (!task.responseLadderPhases) task.responseLadderPhases = new Set();
+  if (task.responseLadderPhases.has(phase)) return false;
+  task.responseLadderPhases.add(phase);
+
+  const { title, content, color } = buildJingweiResponseLadderContent(phase, userContent);
+  let messageId = progressCardId || msgId;
+  let deliveryStatus = "patched";
+  if (progressCardId) {
+    const patched = await patchChatCard(progressCardId, content, title, color).catch(() => false);
+    if (!patched) {
+      deliveryStatus = "text_reply_fallback";
+      messageId = msgId;
+      await replyToLark(msgId, `${title}\n\n${content}`).catch(() => {});
+    }
+  } else {
+    deliveryStatus = "text_reply_sent";
+    await replyToLark(msgId, `${title}\n\n${content}`).catch(() => {});
+  }
+
+  await appendTaskLedger("response_ladder_update_sent", {
+    ...ledgerBase,
+    status: phase === "fourth"
+      ? "extended_wait_clear_commitment"
+      : phase === "third"
+        ? "mid_wait_explicit_confirmation"
+        : phase === "second"
+        ? "long_wait_explicit_next_action"
+        : "short_wait_route_judgment",
+    delivery_status: deliveryStatus,
+    phase,
+    message_id: messageId,
+    title,
+    text_preview: previewForLedger(content, 300),
+  });
+  await appendTaskLedger("workbench_updated", {
+    ...ledgerBase,
+    status: phase === "fourth"
+      ? "response_ladder_extended_wait_visible"
+      : phase === "third"
+        ? "response_ladder_mid_wait_visible"
+        : phase === "second"
+        ? "response_ladder_long_wait_visible"
+        : "response_ladder_short_wait_visible",
+    phase,
+    message_id: messageId,
+    text_preview: previewForLedger(content, 300),
+  });
+  return true;
+}
+
+function scheduleResponseLadder({ taskKey, chatId, progressCardId, msgId, userContent, ledgerBase }) {
+  if (RESPONSE_LADDER_DISABLED) return;
+  const task = activeTasks.get(taskKey);
+  if (!task) return;
+  const scheduleOne = (phase, delayMs) => {
+    const timer = setTimeout(() => {
+      sendResponseLadderUpdate({ phase, taskKey, chatId, progressCardId, msgId, userContent, ledgerBase })
+        .catch(err => console.error("[response-ladder] 更新失败", phase, err.message));
+    }, delayMs);
+    if (typeof timer.unref === "function") timer.unref();
+    return timer;
+  };
+  task.responseLadderTimers = [
+    scheduleOne("first", RESPONSE_LADDER_FIRST_DELAY_MS),
+    scheduleOne("second", RESPONSE_LADDER_SECOND_DELAY_MS),
+    scheduleOne("third", RESPONSE_LADDER_THIRD_DELAY_MS),
+    scheduleOne("fourth", RESPONSE_LADDER_FOURTH_DELAY_MS),
+  ];
+}
+
 // ── 飞书卡片 ──────────────────────────────────────────────────────────────────
-function buildCard({ title, content, options, headerColor = "blue" }) {
+function buildCard({ title, content, options = [], headerColor = "blue" }) {
   // options: [{ label, value?, type? }]  type: "primary"|"danger"|"default"
   const actions = options.map((opt, i) => ({
     tag: "button",
@@ -706,16 +1354,19 @@ function buildCard({ title, content, options, headerColor = "blue" }) {
     type: opt.type || (i === 0 ? "primary" : "default"),
     value: { key: opt.value ?? opt.label, label: opt.label },
   }));
+  const elements = [
+    { tag: "div", text: { tag: "lark_md", content: content } },
+  ];
+  if (actions.length > 0) {
+    elements.push({ tag: "action", actions });
+  }
   return {
     config: { wide_screen_mode: true },
     header: {
       title: { tag: "plain_text", content: title },
       template: headerColor,
     },
-    elements: [
-      { tag: "div", text: { tag: "lark_md", content: content } },
-      { tag: "action", actions },
-    ],
+    elements,
   };
 }
 
@@ -756,6 +1407,7 @@ function buildProgressCardJson(content, title = "⏳ 处理中...", color = "gre
 }
 
 async function createChatCard(chatId, content, title = "⏳ 处理中...", color = "grey") {
+  if (WEBHOOK_REPLAY_MODE) return `om_webhook_replay_card_${Date.now()}`;
   const token = await getAppToken();
   const card = buildProgressCardJson(content, title, color);
   const res = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
@@ -775,7 +1427,29 @@ async function createChatCard(chatId, content, title = "⏳ 处理中...", color
   return data.data?.message_id;
 }
 
+async function sendTextToChat(chatId, text, timeoutMs = 5000) {
+  if (WEBHOOK_REPLAY_MODE) return { ok: true, message_id: `om_webhook_replay_text_${Date.now()}` };
+  const token = await getAppToken();
+  const res = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(timeoutMs),
+    body: JSON.stringify({
+      receive_id: chatId,
+      msg_type: "text",
+      content: JSON.stringify({ text }),
+    }),
+  });
+  const data = await res.json();
+  if (data.code !== 0) {
+    console.error("[sendTextToChat失败]", data.msg, data.code);
+    return { ok: false, error: data.msg, code: data.code };
+  }
+  return { ok: true, message_id: data.data?.message_id };
+}
+
 async function patchChatCard(messageId, content, title = "✅ 完成", color = "blue") {
+  if (WEBHOOK_REPLAY_MODE) return true;
   const token = await getAppToken();
   const card = buildProgressCardJson(content, title, color);
   const res = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}`, {
@@ -1352,6 +2026,89 @@ const tools = [
     },
   },
   {
+    name: "submit_video_project",
+    description: `一次性提交多镜头视频生成计划，专门用于短视频项目。
+适用：用户给了脚本/分镜/多个镜头，或需要 15-30 秒多段视频。
+关键保证：
+- 多镜头必须优先用这个工具一次性提交，避免长工具链中途截断
+- 默认强制 9:16 竖屏；每个视频 prompt 会自动追加比例安全框要求
+- 静态照片、片尾海报、既有素材镜头要标为 scene_type="static_image"/"poster"/"existing_asset"，不会假装在渲染
+- 只有真正拿到 task_id/submit_id 的镜头才返回 status="submitted"`,
+    input_schema: {
+      type: "object",
+      properties: {
+        project_title: {
+          type: "string",
+          description: "项目标题，如「乐淇苹果 · 高考放榜考场纪实」",
+        },
+        aspect_ratio: {
+          type: "string",
+          enum: ["9:16", "16:9", "1:1", "4:3", "3:4"],
+          description: "项目默认比例。抖音/小红书优先 9:16。",
+        },
+        engine: {
+          type: "string",
+          enum: ["seedance", "dreamina"],
+          description: "默认视频引擎。商业/写实短视频优先 seedance。",
+        },
+        default_duration: {
+          type: "number",
+          description: "默认镜头时长，Seedance 会限制在 4-15 秒。",
+        },
+        dry_run: {
+          type: "boolean",
+          description: "仅验证分镜计划和参数，不提交外部生成任务、不消耗 credits。",
+        },
+        scenes: {
+          type: "array",
+          minItems: 1,
+          maxItems: 8,
+          description: "分镜列表。视频镜头会提交生成任务，静态镜头只记录不提交。",
+          items: {
+            type: "object",
+            properties: {
+              scene_id: { type: "string", description: "镜头编号，如 shot_2" },
+              label: { type: "string", description: "镜头短名称" },
+              scene_type: {
+                type: "string",
+                enum: ["video", "static_image", "poster", "existing_asset"],
+                description: "video 才提交渲染；其他类型只记录，避免虚假进度。",
+              },
+              prompt_en: {
+                type: "string",
+                description: "英文视频生成提示词。scene_type=video 时必填。",
+              },
+              duration: {
+                type: "number",
+                description: "镜头时长秒数，自动限制在 4-15。",
+              },
+              aspect_ratio: {
+                type: "string",
+                enum: ["9:16", "16:9", "1:1", "4:3", "3:4"],
+                description: "单镜头比例；默认继承项目比例。",
+              },
+              engine: {
+                type: "string",
+                enum: ["seedance", "dreamina"],
+                description: "单镜头引擎；默认继承项目引擎。",
+              },
+              reference_image_url: {
+                type: "string",
+                description: "图生视频参考图 URL；有参考图时走 image2video。",
+              },
+              notes: {
+                type: "string",
+                description: "字幕、禁忌项、QC 重点等备注。",
+              },
+            },
+            required: ["scene_id", "label", "scene_type"],
+          },
+        },
+      },
+      required: ["project_title", "scenes"],
+    },
+  },
+  {
     name: "get_hot_topics",
     description: `获取国内各大平台的实时热榜。支持平台：
 - weibo: 微博热搜
@@ -1463,6 +2220,37 @@ const tools = [
     },
   },
   {
+    name: "update_card",
+    description: "原地更新已发送的飞书交互式卡片。适用于视频工作台进度、blocker、完成态；必须传入 send_card 返回的 message_id。",
+    input_schema: {
+      type: "object",
+      properties: {
+        message_id: { type: "string", description: "要更新的飞书消息 ID，通常来自 send_card 返回值" },
+        title: { type: "string", description: "更新后的卡片标题" },
+        content: { type: "string", description: "更新后的卡片正文，支持 markdown" },
+        options: {
+          type: "array",
+          description: "可选按钮列表；进度/完成卡通常不需要按钮",
+          items: {
+            type: "object",
+            properties: {
+              label: { type: "string", description: "按钮显示文字" },
+              value: { type: "string", description: "按钮触发的值（可选，默认等于 label）" },
+              type: { type: "string", enum: ["primary", "default", "danger"], description: "按钮样式" },
+            },
+            required: ["label"],
+          },
+        },
+        header_color: {
+          type: "string",
+          enum: ["blue", "wathet", "turquoise", "green", "yellow", "orange", "red", "carmine", "violet", "purple", "indigo", "grey"],
+          description: "卡片头部颜色，进行中 blue，完成 green，阻塞 orange/red。",
+        },
+      },
+      required: ["message_id", "title", "content"],
+    },
+  },
+  {
     name: "get_messages",
     description: "获取指定飞书群聊的历史消息记录。",
     input_schema: {
@@ -1567,11 +2355,14 @@ const tools = [
   },
   {
     name: "delete_message",
-    description: "删除飞书中的一条消息。",
+    description: "删除飞书中的一条消息。破坏性操作，必须显式提供 confirm_delete=CONFIRM_DELETE_FEISHU_MESSAGE。",
     input_schema: {
       type: "object",
-      properties: { message_id: { type: "string", description: "消息 ID" } },
-      required: ["message_id"],
+      properties: {
+        message_id: { type: "string", description: "消息 ID" },
+        confirm_delete: { type: "string", description: "必须精确填写 CONFIRM_DELETE_FEISHU_MESSAGE 才会真实删除" },
+      },
+      required: ["message_id", "confirm_delete"],
     },
   },
   {
@@ -1658,20 +2449,26 @@ const tools = [
   },
   {
     name: "delete_calendar_event",
-    description: "删除飞书日历中的日程。",
+    description: "删除飞书日历中的日程。破坏性操作，必须显式提供 confirm_delete=CONFIRM_DELETE_FEISHU_CALENDAR_EVENT。",
     input_schema: {
       type: "object",
-      properties: { event_id: { type: "string", description: "日程 ID" } },
-      required: ["event_id"],
+      properties: {
+        event_id: { type: "string", description: "日程 ID" },
+        confirm_delete: { type: "string", description: "必须精确填写 CONFIRM_DELETE_FEISHU_CALENDAR_EVENT 才会真实删除" },
+      },
+      required: ["event_id", "confirm_delete"],
     },
   },
   {
     name: "delete_task",
-    description: "删除飞书中的任务。",
+    description: "删除飞书中的任务。破坏性操作，必须显式提供 confirm_delete=CONFIRM_DELETE_FEISHU_TASK。",
     input_schema: {
       type: "object",
-      properties: { task_id: { type: "string", description: "任务 ID" } },
-      required: ["task_id"],
+      properties: {
+        task_id: { type: "string", description: "任务 ID" },
+        confirm_delete: { type: "string", description: "必须精确填写 CONFIRM_DELETE_FEISHU_TASK 才会真实删除" },
+      },
+      required: ["task_id", "confirm_delete"],
     },
   },
   {
@@ -1758,15 +2555,16 @@ const tools = [
   },
   {
     name: "delete_bitable_record",
-    description: "删除飞书多维表格中的记录。",
+    description: "删除飞书多维表格中的记录。破坏性操作，必须显式提供 confirm_delete=CONFIRM_DELETE_FEISHU_BASE_RECORD。",
     input_schema: {
       type: "object",
       properties: {
         app_token: { type: "string", description: "多维表格 app token" },
         table_id: { type: "string", description: "数据表 ID" },
         record_id: { type: "string", description: "记录 ID" },
+        confirm_delete: { type: "string", description: "必须精确填写 CONFIRM_DELETE_FEISHU_BASE_RECORD 才会真实删除" },
       },
-      required: ["app_token", "table_id", "record_id"],
+      required: ["app_token", "table_id", "record_id", "confirm_delete"],
     },
   },
   {
@@ -1900,14 +2698,19 @@ const tools = [
 - 写实/精细/照片感图片 → engine: "gpt-image-1"
 - 艺术感/动漫/插画/水墨/概念艺术图片 → engine: "dreamina"
 - TikTok竖屏短视频/商业广告/产品展示视频 → engine: "seedance"（Seedance 2.0，专为短视频优化，支持4-15秒）
-- 普通视频/图生视频 → engine: "dreamina"
+- 普通视频/图生视频 → engine: "seedance"（直连 Ark，必须返回 task_id）
 - 不确定 → engine: "auto"
 
 Seedance 特别说明：
 - 专为 TikTok/短视频内容优化，720p 高清
 - 支持比例：9:16（竖屏TikTok）/ 16:9（横版）/ 1:1（方形）
 - 时长：4-15秒（用 video_duration 指定）
-- 适合：商业广告、产品展示、品牌视频、世界杯营销素材`,
+- 适合：商业广告、产品展示、品牌视频、世界杯营销素材
+
+Dreamina 视频限制：
+- Dreamina text2video 当前可能只返回 submitted message，不稳定返回 submit_id。
+- 因此禁止把 Dreamina text2video 作为视频主链路；没有 task_id/submit_id 就不能写「渲染中」。
+- text2video 失败时，不能默认改成 4 张静态图 + 字幕/BGM；真实视频 brief 必须继续 Seedance Ark task_id 路线或明确停在 Seedance blocker。`,
     input_schema: {
       type: "object",
       properties: {
@@ -1933,7 +2736,7 @@ Seedance 特别说明：
         engine: {
           type: "string",
           enum: ["auto", "gpt-image-1", "dreamina", "seedance"],
-          description: "生成引擎：auto自动 / gpt-image-1写实图片 / dreamina艺术图片&图生视频 / seedance TikTok短视频专用",
+          description: "生成引擎：auto自动 / gpt-image-1写实图片 / dreamina艺术图片 / seedance可追踪视频",
         },
         count: {
           type: "number",
@@ -1945,7 +2748,7 @@ Seedance 特别说明：
         },
         video_duration: {
           type: "number",
-          description: "视频时长（秒）。dreamina: 5或10；seedance: 4-15，建议5或10",
+          description: "视频时长（秒）。seedance: 4-15，建议5或10",
         },
       },
       required: ["media_type", "prompt_en", "style", "aspect_ratio", "engine"],
@@ -2055,24 +2858,57 @@ Seedance 特别说明：
   },
 ];
 
+function confirmationScopeKey(chatId, senderOpenId) {
+  return senderOpenId ? senderSessionKey(chatId, senderOpenId) : `chat:${chatId || "missing_chat"}`;
+}
+
 // ── 隐私安全 guard：检查外发操作是否需要用户二次确认 ─────────────────────────
 // 返回 true = 已确认可继续，返回 false = 已拦截（调用方应返回 requires_confirmation）
 function _checkOutboundConfirm(ctx, target, preview, toolName = null, toolInput = null) {
-  const { chatId } = ctx;
-  const key = `${chatId}:${target}`;
+  const { chatId, senderOpenId, senderSessionKey: scopedSenderSessionKey } = ctx;
+  const scope = scopedSenderSessionKey || confirmationScopeKey(chatId, senderOpenId);
+  const key = `${scope}:${target}`;
   if (confirmedOps.has(key)) {
     confirmedOps.delete(key);
     return true;
   }
   // 存入 pending，5 分钟有效，同时记录工具调用参数供确认后回放
-  pendingConfirmations.set(chatId, {
+  pendingConfirmations.set(scope, {
     target,
     preview,
+    chatId,
+    senderOpenId,
+    senderSessionKey: scope,
     expires: Date.now() + 5 * 60 * 1000,
     toolName,
     toolInput,
   });
   return false;
+}
+
+const DESTRUCTIVE_CONFIRMATION_TOKENS = Object.freeze({
+  delete_message: "CONFIRM_DELETE_FEISHU_MESSAGE",
+  delete_calendar_event: "CONFIRM_DELETE_FEISHU_CALENDAR_EVENT",
+  delete_task: "CONFIRM_DELETE_FEISHU_TASK",
+  delete_bitable_record: "CONFIRM_DELETE_FEISHU_BASE_RECORD",
+});
+
+function requireDestructiveConfirmation(toolName, input = {}, target = {}) {
+  const required = DESTRUCTIVE_CONFIRMATION_TOKENS[toolName] || "";
+  const provided = String(input.confirm_delete || input.confirm || input.confirmation || "").trim();
+  if (required && provided === required) return null;
+  return JSON.stringify({
+    ok: false,
+    blocked: true,
+    no_delete: true,
+    no_write: true,
+    failure_stage: "Feishu destructive confirmation",
+    tool_name: toolName,
+    required_confirmation_token: required,
+    provided_confirmation_accepted: false,
+    target,
+    message: `删除操作已拦截：需要显式提供 ${required}。`,
+  });
 }
 
 // Execute a tool call
@@ -2164,6 +3000,8 @@ async function executeTool(name, input, ctx = {}) {
       return JSON.stringify(
         await runRemotionExec(input.compositionId, input.outputPath, input.props)
       );
+    case "submit_video_project":
+      return JSON.stringify(await submitVideoProject(input, ctx));
     case "get_hot_topics":
       return JSON.stringify(await hotTopicsExec(input.platform || "all", input.limit || 20));
     case "get_calendar_events":
@@ -2212,6 +3050,13 @@ async function executeTool(name, input, ctx = {}) {
         headerColor: input.header_color,
       }));
     }
+    case "update_card":
+      return JSON.stringify(await updateCard(input.message_id, {
+        title: input.title,
+        content: input.content,
+        options: input.options || [],
+        headerColor: input.header_color || "blue",
+      }));
     case "get_messages":
       return JSON.stringify(await getMessages(input.chat_id, input.page_size));
     case "send_direct_message": {
@@ -2245,8 +3090,11 @@ async function executeTool(name, input, ctx = {}) {
       return JSON.stringify(await searchMessages(input.query, input.page_size));
     case "get_department_members":
       return JSON.stringify(await getDepartmentMembers(input.department_id));
-    case "delete_message":
+    case "delete_message": {
+      const blocked = requireDestructiveConfirmation("delete_message", input, { message_id: input.message_id });
+      if (blocked) return blocked;
       return await deleteMessage(input.message_id);
+    }
     case "get_chat_members":
       return JSON.stringify(await getChatMembers(input.chat_id));
     case "pin_message":
@@ -2274,10 +3122,16 @@ async function executeTool(name, input, ctx = {}) {
       return await addGroupMember(input.chat_id, input.open_ids);
     case "update_group_info":
       return await updateGroupInfo(input.chat_id, input.name, input.description);
-    case "delete_calendar_event":
+    case "delete_calendar_event": {
+      const blocked = requireDestructiveConfirmation("delete_calendar_event", input, { event_id: input.event_id });
+      if (blocked) return blocked;
       return await deleteCalendarEvent(input.event_id);
-    case "delete_task":
+    }
+    case "delete_task": {
+      const blocked = requireDestructiveConfirmation("delete_task", input, { task_id: input.task_id });
+      if (blocked) return blocked;
       return await deleteTask(input.task_id);
+    }
     case "append_doc_content":
       return await appendDocContent(input.doc_token, input.content);
     case "search_wiki":
@@ -2292,8 +3146,15 @@ async function executeTool(name, input, ctx = {}) {
       return JSON.stringify(await createBitableRecord(input.app_token, input.table_id, input.fields));
     case "update_bitable_record":
       return await updateBitableRecord(input.app_token, input.table_id, input.record_id, input.fields);
-    case "delete_bitable_record":
+    case "delete_bitable_record": {
+      const blocked = requireDestructiveConfirmation("delete_bitable_record", input, {
+        app_token: input.app_token,
+        table_id: input.table_id,
+        record_id: input.record_id,
+      });
+      if (blocked) return blocked;
       return await deleteBitableRecord(input.app_token, input.table_id, input.record_id);
+    }
     case "get_sheet_values":
       return JSON.stringify(await getSheetValues(input.spreadsheet_token, input.range));
     case "update_sheet_values":
@@ -2339,15 +3200,15 @@ const historyLoaded = new Set();
 const sessionTurnCounts = new Map();
 
 // ── 隐私安全确认机制 ──────────────────────────────────────────────────────────
-// pendingConfirmations: chatId → { tool, target, preview, expires }
+// pendingConfirmations: senderSessionKey/chatId → { tool, target, preview, expires }
 //   存储待确认的外发操作，等用户二次确认
 const pendingConfirmations = new Map();
-// confirmedOps: Set of "chatId:target" keys
+// confirmedOps: Set of "senderSessionKey:target" keys
 //   用户确认后写入，executeTool 消费后删除（一次性通行证）
 const confirmedOps = new Set();
 
 // ── 并发任务 & 中断机制 ────────────────────────────────────────────────────────
-// senderOpenId → { interruptMsg: string|null }
+// senderSessionKey(chatId, senderOpenId) → { interruptMsg: string|null }
 // 群里每个用户独立一个槽位，互不干扰（天然并发）
 // 同一用户再发消息时注入中断，而非另起任务
 const activeTasks = new Map();
@@ -2405,13 +3266,7 @@ async function recoverMissedMessages() {
         if (!["text", "post"].includes(msg.msg_type)) continue;
 
         // 群聊只恢复 @bot 的消息
-        if (chat.chat_type === "group") {
-          const mentions = msg.mentions || [];
-          const mentioned = botOpenId
-            ? mentions.some(m => m.id?.open_id === botOpenId)
-            : mentions.length > 0;
-          if (!mentioned) continue;
-        }
+        if (chat.chat_type === "group" && !messageMentionsJingweiBot(msg)) continue;
 
         const msgTime = parseInt(msg.create_time, 10);
         // bot 在此消息之后有过回复 → 视为已处理
@@ -2486,6 +3341,7 @@ function toolProgressMsg(name, input) {
   if (name === "write_workdir_file") return "📝 写入工作目录文件...";
   if (name === "run_ffmpeg")     return "🎬 FFmpeg 处理视频...";
   if (name === "run_remotion")   return "✨ Remotion 渲染动画...";
+  if (name === "submit_video_project") return "🎬 正在批量提交视频分镜...";
   if (name === "run_dreamina")             return "🎨 正在生成图像/视频...";
   if (name === "web_search")               return `🔍 正在搜索：${input?.query}`;
   if (name === "fetch_webpage")            return `🌐 正在读取网页：${input?.url?.slice(0, 60)}...`;
@@ -2517,8 +3373,8 @@ async function generateCreativeContent(brief, ctx = {}) {
   let actualEngine = engine;
   if (engine === "auto") {
     if (media_type === "video") {
-      // 商业/竖屏/TikTok内容默认用 Seedance 2.0
-      actualEngine = ["cinematic", "commercial", "realistic"].includes(style) ? "seedance" : "dreamina";
+      // 视频默认使用可追踪 task_id 的 Seedance Ark，不再降级到 Dreamina text2video。
+      actualEngine = "seedance";
     } else if (["anime", "illustration", "painting"].includes(style)) {
       actualEngine = "dreamina";
     } else {
@@ -2532,58 +3388,31 @@ async function generateCreativeContent(brief, ctx = {}) {
     const dur = Math.min(Math.max(video_duration || 5, 4), 15);
     const label = (brief.subject || prompt_en).slice(0, 24);
 
-    if (process.env.SEEDANCE_ARK_KEY) {
-      // ✅ 直连 Ark API + 后台轮询（不阻塞 agent，不受超时限制）
-      const submitResult = await arkVideoSubmit({ prompt: prompt_en, duration: dur, ratio });
-      if (submitResult.error) return JSON.stringify({ error: submitResult.error });
-      const taskId = submitResult.task_id;
-      if (!taskId) return JSON.stringify({ error: "Ark API 未返回 task_id", detail: submitResult });
-      if (ctx.chatId) startVideoBackgroundPoll(taskId, ctx.chatId, label, arkVideoQuery);
-      return JSON.stringify({
-        status: "submitted",
-        engine: "seedance-ark",
-        task_id: taskId,
-        message: `🎬 Seedance 视频已提交（Ark直连），后台轮询中，完成后自动推送 ⏳`,
-      });
-    }
-
-    // 降级：dreamina CLI + 后台轮询
-    const args = reference_image_url
-      ? ["image2video", "--image_url", reference_image_url, "--prompt", prompt_en,
-         "--ratio", ratio, "--duration", String(dur), "--model_version", "seedance2.0"]
-      : ["text2video", "--prompt", prompt_en,
-         "--ratio", ratio, "--duration", String(dur), "--model_version", "seedance2.0"];
-    const submitResult = await dreaminaExec(args);
-    const sd = typeof submitResult.output === "object" ? submitResult.output : {};
-    const submitId = sd?.data?.submit_id;
-    if (!submitId) return JSON.stringify({ error: "Seedance 视频任务提交失败", detail: sd });
-    if (ctx.chatId) startDreaminaBackgroundPoll(submitId, ctx.chatId, label);
-    return JSON.stringify({
-      status: "submitted",
-      engine: "seedance-dreamina",
-      submit_id: submitId,
-      message: `🎬 Seedance 视频已提交，后台轮询中（60分钟超时），完成后自动推送 ⏳`,
+    // ✅ 直连 Ark API + 后台轮询（不阻塞 agent，不受 Dreamina submit_id 限制）
+    const submitResult = await arkVideoSubmit({
+      prompt: enforceVideoPromptConstraints(prompt_en, ratio),
+      duration: dur,
+      ratio,
+      referenceImageUrl: reference_image_url,
     });
+    if (submitResult.error) return { error: submitResult.error };
+    const taskId = submitResult.task_id;
+    if (!taskId) return { error: "Ark API 未返回 task_id", detail: submitResult };
+    if (ctx.chatId) startVideoBackgroundPoll(taskId, ctx.chatId, label, arkVideoQuery);
+    return {
+      status: "submitted",
+      engine: "seedance-ark",
+      task_id: taskId,
+      message: `🎬 Seedance 视频已提交（Ark直连），后台轮询中，完成后自动推送 ⏳`,
+    };
   }
 
-  // ── VIDEO via Dreamina（图生视频/艺术风格）+ 后台轮询 ─────────────────────────
+  // ── VIDEO via Dreamina disabled（当前 text2video 不稳定返回 submit_id）───────
   if (media_type === "video") {
-    const ratio = DREAMINA_RATIO_MAP[aspect_ratio] || "16:9";
-    const label = (brief.subject || prompt_en).slice(0, 24);
-    const args = reference_image_url
-      ? ["image2video", "--image_url", reference_image_url, "--prompt", prompt_en, "--duration", String(video_duration)]
-      : ["text2video", "--prompt", prompt_en, "--duration", String(video_duration)];
-    const submitResult = await dreaminaExec(args);
-    const sd = typeof submitResult.output === "object" ? submitResult.output : {};
-    const submitId = sd?.data?.submit_id;
-    if (!submitId) return JSON.stringify({ error: "视频任务提交失败", detail: sd });
-    if (ctx.chatId) startDreaminaBackgroundPoll(submitId, ctx.chatId, label);
-    return JSON.stringify({
-      status: "submitted",
-      engine: "dreamina",
-      submit_id: submitId,
-      message: `🎬 视频已提交，后台轮询中，完成后自动推送 ⏳`,
-    });
+    return {
+      error: "Dreamina text2video 当前无法稳定返回 submit_id，不能作为视频主链路。请改用 engine='seedance' 或 submit_video_project。",
+      engine: actualEngine,
+    };
   }
 
   // ── IMAGE via Dreamina ─────────────────────────────────────────────────────
@@ -2613,11 +3442,21 @@ async function generateCreativeContent(brief, ctx = {}) {
 // userContent: string (text) or array of Claude content blocks (multi-modal)
 // onProgress: optional async (msg: string) => void，每步工具调用前回调
 async function runAgent(chatId, userContent, onProgress, msgId = null, senderOpenId = null) {
+  const currentSenderSessionKey = senderSessionKey(chatId, senderOpenId);
+  const currentConfirmationScope = confirmationScopeKey(chatId, senderOpenId);
+  if (WEBHOOK_REPLAY_MODE) {
+    if (onProgress) await onProgress("本地 webhook 回放：正在验证 sender-scoped 进度链路");
+    const replayDelayMs = Number(process.env.JINGWEI2_WEBHOOK_REPLAY_DELAY_MS || 0);
+    if (Number.isFinite(replayDelayMs) && replayDelayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, replayDelayMs));
+    }
+    return "✅ 经纬2号本地 webhook 回放完成";
+  }
   // ── 隐私安全：检测用户是否在确认一条待发送操作 ────────────────────────────────
   let isConfirmTurn = false;
   let confirmedPending = null; // 存储确认的 pending 信息（含 toolName/toolInput）
-  if (pendingConfirmations.has(chatId)) {
-    const pending = pendingConfirmations.get(chatId);
+  if (pendingConfirmations.has(currentConfirmationScope)) {
+    const pending = pendingConfirmations.get(currentConfirmationScope);
     if (Date.now() < pending.expires) {
       const msgText =
         typeof userContent === "string"
@@ -2627,14 +3466,14 @@ async function runAgent(chatId, userContent, onProgress, msgId = null, senderOpe
           : "";
       if (/[确認]认[发發]?送|[确認]认转发|^[\s]*(发送|确认|是的|好的|yes|confirm|ok)/i.test(msgText.trim())) {
         // 用户确认，写入一次性通行证
-        confirmedOps.add(`${chatId}:${pending.target}`);
+        confirmedOps.add(`${currentConfirmationScope}:${pending.target}`);
         confirmedPending = { ...pending }; // 保存副本供注入用
-        pendingConfirmations.delete(chatId);
+        pendingConfirmations.delete(currentConfirmationScope);
         isConfirmTurn = true;
-        console.log(`[privacy] 用户确认发送 target=${pending.target} tool=${pending.toolName}`);
+        console.log(`[privacy] 用户确认发送 scope=${currentConfirmationScope} target=${pending.target} tool=${pending.toolName}`);
       }
     } else {
-      pendingConfirmations.delete(chatId);
+      pendingConfirmations.delete(currentConfirmationScope);
     }
   }
 
@@ -2709,7 +3548,14 @@ ${memorySection}
 
 ## 🎬 视频内容生产工作流（核心能力）
 
-你在视频内容生产中担任「协调者」角色：理解需求 → PlanMode/直接制作 → 开工作台卡片 → 脚本+生成 → 交付。
+你在视频内容生产中担任「制片总控」角色：理解需求 → PlanMode/直接制作 → 开工作台卡片 → 脚本+生成 → 包装/QC → Feishu 原生视频交付。
+
+**硬性边界：真实视频请求不能偷换成图片交付。**
+- 用户要真实镜头、产品场景、人物动作、商业短视频或明确提到 Seedance 时，主链路是 Seedance 2.0 / Seedance Ark；每个真实镜头必须返回可追踪 task_id，未返回 task_id 就停在 Seedance blocker。
+- 不要把 text2video 提交失败默认降级成「4 张静态图 + 字幕」；不要让用户回复「生成图片」来替代视频目标。
+- 图片只能作为参考图、封面、插画、标题视觉、包装素材或用户明确要求的样图，不能当作真实视频生成队列的默认恢复方案。
+- 若用户已明确说「Seedance 花费没问题」「继续」「不需要我批复」或同义授权，本轮可继续 Seedance/本地剪辑执行，但要在工作台记录成本/风险/授权来源和 task_id。
+- 若 Seedance/Ark 确实不可用，回复必须标明失败阶段为 Seedance task submission / traceability，并给出下一步恢复动作：重试 Ark、等待 task_id、同步已有 task_id、或转到 HyperFrames/Remotion 仅做解释型包装；不能把静态图片方案包装成已解决。
 
 ### ⚡ PlanMode — 方向未定时先出预案
 
@@ -2723,25 +3569,57 @@ ${memorySection}
 \`\`\`
 title: "📋 创意预案 · [品牌/产品]"
 内容：
+**方案摘要**
+- 标题：[视频标题]
+- 核心信息：[一句话价值主张]
+- 受众：[目标人群]
+- 发布平台：[抖音/小红书/TikTok/B站/飞书汇报等]
+- 时长/比例：[15s/30s/60s + 9:16/16:9/1:1]
+- 风格：[商业写实/教程解释/信息图/剧情/产品场景]
+
 **素材信号分析**
 - 已有：[素材类型及质量评估]
 - 缺失：[需要补充的关键素材]
 
-**方向 A：[叙事类型]**
-Hook：[0-3s 开场钩子]
-主线：[核心叙事逻辑]
-风格：[情绪+调色]
-时长：[建议时长]
+**分镜方案（3-6 个镜头）**
+1. [镜头标题]：[景别/运镜/画面动作/时长]
+2. [镜头标题]：[景别/运镜/画面动作/时长]
+3. [镜头标题]：[景别/运镜/画面动作/时长]
 
-**方向 B：[叙事类型]**
-（同上结构）
+**素材需求**
+- Seedance 真实镜头：[需要生成的镜头和 task_id 要求]
+- 包装素材：[标题卡/字幕/图表/封面/品牌元素]
 
-**方向 C：[叙事类型]**
-（同上结构）
+**口播/字幕需求**
+- 口播：[需要/不需要，语言和语气]
+- 字幕：[烧录/外挂/仅包装文字]
 
-**推荐：** 方向X，原因：[1句话说明为何最适合当前素材和平台]
+**风险与成本确认**
+- Seedance/Ark：[是否需要花费、是否已有授权、task_id 追踪要求]
+- HyperFrames/Remotion/FFmpeg：[本地渲染风险]
+- drawtext：[FFmpeg 缺少 drawtext 时字幕烧录可降级，不阻断主成片]
+
+**推荐：** [路线]，原因：[1句话说明为何最适合当前素材和平台]
 \`\`\`
 用户选定方向后（回复「A」「B」「C」或直接说选哪个），**立即全自动执行第一步到第五步，一步接一步跑完，不展示中间产物等确认，直到视频交付完成**。唯一暂停情形：用户主动插嘴（触发中断）或素材缺失必须用户提供。
+
+### 🎛️ V-Makaron 式工作台原则
+
+学习 VMakaron 的强交互方式：先做制片计划，再进入制作工作台，所有状态必须真实。
+
+**计划卡必须锁住 6 件事：**
+1. 目标：平台、比例、时长、版本名
+2. 素材角色：每张图/视频是谁、干什么、能不能用
+3. 叙事动作：前 2 秒 hook、核心镜头、收尾方式
+4. 硬约束：人物锚点、产品准确、9:16 / 16:9、是否允许静态照片
+5. 禁止项 / QC 红线：不要 AI 文字、不要换人、不要横版、不要虚假口型等
+6. 交付方式：原生视频/链接/素材清单，以及是否需要后期合成
+
+**制作卡必须像工作台，不像聊天流水：**
+- 显示任务方向、当前状态、进度、事件日志、产物区、blocker。
+- 遇到权限、额度、素材下载、任务提交失败时，状态停在 blocker，并说明下一步怎么解除。
+- 旧卡/重复任务必须明确标记「已停止 / 以新卡为准」。
+- 禁止把未拿到 task_id/submit_id 的镜头写成「渲染中」。
 
 ---
 
@@ -2758,7 +3636,7 @@ Hook：[0-3s 开场钩子]
 
 ### 第二步：开工作台卡片（制作开始的第一个动作）
 
-需求确认后，**立即用 send_card 创建工作台卡片**，整个制作过程只 PATCH 这一张：
+需求确认后，**立即用 send_card 创建工作台卡片，保存返回的 message_id**，整个制作过程只用 update_card 更新这一张：
 
 \`\`\`
 title: "🎬 视频工作台 · [品牌] · [方向简述]"
@@ -2777,6 +3655,12 @@ title: "🎬 视频工作台 · [品牌] · [方向简述]"
 | 提交生成 | ██████░░░░ 60% | ⏳ 提交生成中 |
 | 等待渲染 | ████████░░ 80% | ⏳ 渲染中约2-5分钟 |
 | 视频取回 + 上传群 | ██████████ 100% | ✅ 已完成 |
+
+工作台内容必须包含：
+- 事件日志：最近 3-5 个真实动作，例如「素材已下载」「镜头2 task_id=...」「镜头3 未提交：缺 prompt」
+- 产物区：已完成视频/图片链接或文件名
+- Blocker：如果存在额度、权限、下载、比例错误、任务失败，必须明确写出来
+- 任何中途进度和完成态都使用 update_card；不要用 send_message 或重复 send_card 刷屏。
 
 ---
 
@@ -2799,25 +3683,41 @@ title: "🎬 视频工作台 · [品牌] · [方向简述]"
 文案/台词：……
 \`\`\`
 
+**高质量视频 prompt 标准（每个 video 镜头必须满足）：**
+- 主体锚点：只保留 1 个最重要主体；有参考图时写清必须保留人物/产品特征。
+- 动作单元：单镜头只做 1 个可读动作，不要把多个剧情转折塞进同一个生成任务。
+- 镜头语言：写明 camera movement（slow push-in / tracking shot / handheld documentary 等），避免模型乱切。
+- 光影质感：写明 realistic commercial lighting、premium texture、clean background。
+- 平台安全框：竖版必须写 \`vertical 9:16 portrait video, 720p, mobile-first composition, no horizontal framing\`。
+- 负面约束：不要 unreadable AI text、random logos、warped faces、distorted product shape、fake lip sync。
+
+如果用户只是说「做得高级一点 / 质量好一点」，默认使用写实商业短片标准：真实材质、自然运动、干净背景、前 2 秒明确 hook、结尾给产品或品牌记忆点。
+
 热点结合：先调 get_hot_topics，选1-2个最相关热点融入开场 hook 或旁白。
 
 ---
 
 ### 第四步：视频生成
 
-- 有人物/产品参考图 → image2video（参考图作 reference）
-- 无素材 → text2video
-- 每镜头生成完 → PATCH 工作台卡片进度
-- 多镜头全部完成 → FFmpeg 拼接：
+- 多镜头脚本（2个以上镜头）→ **必须优先调用 submit_video_project 一次性提交**，不要连续调用 generate_creative_content / run_dreamina 多次，避免工具链中途截断。
+- submit_video_project 返回后，只能把 status="submitted" 的镜头写成「已提交/渲染中」；status="not_submitted" 的静态照片/海报镜头必须写成「静态素材/待合成」，不能写成渲染中。
+- 抖音/小红书默认 aspect_ratio="9:16"。如果用户指出「应该是9:16」或上传了竖版脚本，所有视频镜头必须显式传 aspect_ratio="9:16"。
+- 有人物/产品参考图 → reference_image_url + image2video；无素材 → text2video。
+- Dreamina text2video 不作为主链路。若 text2video/Dreamina/Jimeng 失败，默认继续 Seedance Ark / submit_video_project 或回到 PlanMode blocker；禁止推荐「生成 4 张图 + 字幕/BGM」作为最快落地方案，除非用户明确把目标改成图片版样张。
+- 多镜头全部完成后再考虑 FFmpeg 拼接：
   \`ffmpeg -f concat -safe 0 -i filelist.txt -c copy final.mp4\`
+- 如果工具结果没有返回 task_id / submit_id，不得声称该镜头已提交；应明确报「未提交成功」和失败原因。
 
 ---
 
 ### 第五步：交付
 
-1. 把视频上传回当前聊天（run_lark_cli 上传文件）
-2. PATCH 工作台卡片为完成状态（绿色，100%，附视频链接）
-3. 说明：引擎、时长、各镜头提示词（方便复用/调整）
+1. 需要字幕/口播/标题卡/信息图动画时，走 HyperFrames / Remotion / FFmpeg 包装链路，生成 DESIGN.md、HTML composition、渲染脚本和最终 MP4。
+2. 渲染前执行 lint；渲染后用 ffprobe 校验分辨率、时长、帧率、音频轨和可播放性。
+3. 把视频上传回当前聊天（run_lark_cli 上传原生视频文件）
+4. PATCH 工作台卡片为完成状态（绿色，100%，附视频链接）
+5. 说明：MP4 成片、封面图、DESIGN.md、生成日志、Seedance task_id 列表、ffprobe 校验结果、Feishu 原生视频发送状态。
+6. 若失败，明确失败发生在 PlanMode、Seedance、HyperFrames、Remotion、FFmpeg、QC、上传或 Feishu 投递哪一环。
 
 ---
 
@@ -2889,14 +3789,20 @@ args=["api", "GET", "/open-apis/im/v1/messages",
 
   引擎选择：
   - 写实/照片感/精细细节 → engine: "gpt-image-1"
-  - 插画/动漫/水墨/艺术概念 → engine: "dreamina"
-  - 视频 → engine: "dreamina"（自动选 text2video 或 image2video）
+  - 插画/动漫/水墨/艺术概念图片 → engine: "dreamina"
+  - 单镜头视频 → engine: "seedance"（直连 Ark，必须返回 task_id）
+  - 多镜头视频 → submit_video_project
+
+  视频禁区：
+  - Dreamina text2video 当前不稳定返回 submit_id，禁止作为主视频链路。
+  - 没有 task_id/submit_id 的结果只能写「未提交成功 / blocker」，不能写「渲染中」。
+  - text2video/Dreamina/Jimeng 失败时，不要推荐「4 张静态图 + 字幕/BGM」替代真实视频；除非用户明确改目标为图片版样张，否则继续 Seedance Ark / submit_video_project 或报告 Seedance blocker。
 
   图片生成成功后直接告知用户；视频生成需轮询，完成后告知下载链接或结果。
 
 **视频后处理：run_ffmpeg + run_remotion（拼接与动画）**
 
-使用场景：视频片段已生成（Dreamina/Seedance），需要拼接、转场、加字幕、品牌片头/片尾。
+使用场景：视频片段已生成（Seedance 或用户已有素材），需要拼接、转场、加字幕、品牌片头/片尾。
 
 工作目录：/tmp/jw2work/  所有中间文件都放这里。
 
@@ -2920,7 +3826,7 @@ args=["api", "GET", "/open-apis/im/v1/messages",
   ffmpeg -i main.mp4 -i overlay.mp4 -filter_complex "[0:v][1:v]overlay=0:0" output.mp4
 
 【完整视频交付流程（有片头/字幕）】
-1. run_dreamina → 生成各个视频片段（存入 /tmp/jw2work/）
+1. submit_video_project / generate_creative_content(engine="seedance") → 生成各个视频片段（存入 /tmp/jw2work/ 或后台推送）
 2. run_remotion TitleCard → 生成品牌片头 title.mp4
 3. run_ffmpeg concat → 把片头 + 各片段拼接成 final.mp4
 4. （可选）run_remotion TextOverlay + ffmpeg overlay → 叠加字幕
@@ -3094,7 +4000,12 @@ args=["api", "GET", "/open-apis/im/v1/messages",
             if (msg) onProgress(`第 ${toolCallCount} 步：${msg}`).catch(() => {});
           }
           console.log(`[工具] ${block.name}(${JSON.stringify(block.input)})`);
-          const result = await executeTool(block.name, block.input, { msgId, chatId });
+          const result = await executeTool(block.name, block.input, {
+            msgId,
+            chatId,
+            senderOpenId,
+            senderSessionKey: currentSenderSessionKey,
+          });
           console.log(`[结果] ${result.slice(0, 200)}`);
           toolResults.push({
             type: "tool_result",
@@ -3107,15 +4018,16 @@ args=["api", "GET", "/open-apis/im/v1/messages",
       messages.push({ role: "user", content: toolResults });
 
       // 中断检测：用户在执行过程中发来了新指令
-      if (senderOpenId && activeTasks.has(senderOpenId)) {
-        const task = activeTasks.get(senderOpenId);
+      if (activeTasks.has(currentSenderSessionKey)) {
+        const task = activeTasks.get(currentSenderSessionKey);
         if (task.interruptMsg) {
           const interrupted = task.interruptMsg;
+          const interruptedText = previewForLedger(interrupted, 600);
           task.interruptMsg = null;
-          console.log(`[interrupt] 注入中断 from=${senderOpenId} msg=${interrupted.slice(0, 60)}`);
+          console.log(`[interrupt] 注入中断 session=${currentSenderSessionKey} msg=${previewForLedger(interruptedText, 60)}`);
           messages.push({
             role: "user",
-            content: `[用户中断] 用户在执行过程中发来了新指令：「${interrupted}」\n请立刻停止当前步骤，先用一句话告知用户你已暂停，再复述新指令确认理解，然后问他：继续当前任务 / 切换方向 / 取消？`,
+            content: `[用户中断] 用户在执行过程中发来了新指令：「${interruptedText}」\n请立刻停止当前步骤，先用一句话告知用户你已暂停，再复述新指令确认理解，然后问他：继续当前任务 / 切换方向 / 取消？`,
           });
         }
       }
@@ -3198,6 +4110,7 @@ args=["api", "GET", "/open-apis/im/v1/messages",
 
 // Reply to a Feishu message
 async function replyToLark(messageId, text) {
+  if (WEBHOOK_REPLAY_MODE) return { ok: true, message_id: messageId };
   await larkClient.im.message.reply({
     path: { message_id: messageId },
     data: {
@@ -3276,7 +4189,7 @@ async function fetchBotInfo() {
     const data = await res.json();
     botOpenId = data.bot?.open_id || "";
     if (botOpenId) console.log(`✅ Bot open_id: ...${botOpenId.slice(-8)}`);
-    else console.warn("[bot-info] 未能获取 bot open_id，群聊将按 mentions 非空判断");
+    else console.warn("[bot-info] 未能获取 bot open_id，群聊将按 mention 名称匹配经纬2号/智能体");
   } catch (err) {
     console.error("[bot-info] 获取失败:", err.message);
   }
@@ -3289,9 +4202,7 @@ const recentErrors = [];
 const recentPostPayloads = [];
 
 // Webhook handler
-app.post("/webhook", async (req, res) => {
-  const body = req.body;
-
+async function handleWebhookBody(body, res) {
   if (body.type === "url_verification") {
     return res.json({ challenge: body.challenge });
   }
@@ -3351,6 +4262,8 @@ app.post("/webhook", async (req, res) => {
   // Declare msgId outside try so catch block can reference it
   let msgId;
   let progressCardId = null;
+  let taskKey = null;
+  let ledgerBase = null;
 
   try {
     const event = body.event;
@@ -3417,14 +4330,21 @@ app.post("/webhook", async (req, res) => {
 
     const content = JSON.parse(message.content);
     const chatId = message.chat_id;
+    const senderOpenId = event.sender?.sender_id?.open_id || null;
+    taskKey = senderSessionKey(chatId, senderOpenId);
+    ledgerBase = {
+      chat_id: chatId,
+      sender_open_id: senderOpenId || "",
+      sender_session_key: taskKey,
+      source_message_id: msgId,
+      request_message_id: msgId,
+      chat_type: message.chat_type || "",
+      message_type: message.message_type || "",
+    };
 
     // 非 p2p 聊天（群聊/部门群等）必须 @bot 才响应
     if (message.chat_type !== "p2p") {
-      const mentions = message.mentions || [];
-      const mentioned = botOpenId
-        ? mentions.some(m => m.id?.open_id === botOpenId)
-        : mentions.length > 0;
-      if (!mentioned) {
+      if (!messageMentionsJingweiBot(message)) {
         console.log(`[group-filter] 未 @bot，忽略 chat_type=${message.chat_type}`);
         return;
       }
@@ -3434,13 +4354,15 @@ app.post("/webhook", async (req, res) => {
     let userContent;
 
     if (message.message_type === "text") {
-      userContent = content.text.replace(/@[^\s]+\s*/g, "").trim();
+      userContent = stripJingweiBotMentionText(content.text);
       if (!userContent) return;
     } else if (message.message_type === "post") {
       // Feishu post: either {zh_cn:{content:[...]}} or directly {title:"",content:[...]}
       const lang = content.zh_cn || content.en_us || content;
       const blocks = (lang?.content || []).flat();
-      const textContent = blocks.filter(e => e.tag === "text").map(e => e.text).join("").trim();
+      const textContent = stripJingweiBotMentionText(
+        blocks.filter(e => e.tag === "text").map(e => e.text).join("").trim()
+      );
       const imgKeys = blocks.filter(e => e.tag === "img" && e.image_key).map(e => e.image_key);
 
       console.log(`[post] textLen=${textContent.length} imgKeys=${imgKeys.length}`);
@@ -3472,9 +4394,11 @@ app.post("/webhook", async (req, res) => {
     }
 
     console.log(`[收到:${message.message_type}] ${chatId}`);
-
-    // 提前提取 senderOpenId（安全检测 & 中断机制均需要）
-    const senderOpenId = event.sender?.sender_id?.open_id || null;
+    await appendTaskLedger("user_message_received", {
+      ...ledgerBase,
+      message_id: msgId,
+      text_preview: previewForLedger(userContent),
+    });
 
     // ─── 安全检测：规则变更 / 提示词注入拦截 ────────────────────────────────
     const textToCheck = typeof userContent === "string"
@@ -3488,41 +4412,160 @@ app.post("/webhook", async (req, res) => {
       await replyToLark(msgId,
         "⚠️ 检测到规则变更请求。此类操作需经张经纬审批，已自动上报，请等待审批结果。"
       ).catch(() => {});
+      await appendTaskLedger("fast_ack_sent", {
+        ...ledgerBase,
+        status: "security_blocked",
+        message_id: msgId,
+      });
+      await appendTaskLedger("final_message_sent", {
+        ...ledgerBase,
+        status: "security_blocked",
+        progress: 100,
+        message_id: msgId,
+      });
+      return;
+    }
+
+    const plainUserText = plainTextFromUserContent(userContent);
+    if (isLightweightInteractionText(plainUserText)) {
+      const instantReply = buildJingweiInstantReply(plainUserText);
+      await replyToLark(msgId, instantReply).catch((e) => {
+        const errEntry = { ts: new Date().toISOString(), stage: "instant_reply", msg_id: msgId?.slice(-8), error: e.message, code: e.code };
+        recentErrors.push(errEntry);
+        if (recentErrors.length > 20) recentErrors.shift();
+        console.error("[instant回复失败]", JSON.stringify(errEntry));
+      });
+      await appendTaskLedger("instant_interaction_replied", {
+        ...ledgerBase,
+        status: "instant_replied",
+        progress: 100,
+        message_id: msgId,
+        reply_message_id: msgId,
+        text_preview: previewForLedger(plainUserText),
+        reply_preview: previewForLedger(instantReply),
+      });
+      await appendTaskLedger("final_message_sent", {
+        ...ledgerBase,
+        status: "instant_completed",
+        progress: 100,
+        message_id: msgId,
+        text_preview: previewForLedger(instantReply),
+      });
       return;
     }
 
     // ─── 中断检测：同一用户已有任务在跑 → 存为插嘴，不另起任务 ──────────────
-    if (senderOpenId && activeTasks.has(senderOpenId)) {
-      activeTasks.get(senderOpenId).interruptMsg = userContent;
-      console.log(`[interrupt] 存入中断 from=${senderOpenId}`);
-      await replyToLark(msgId, "⏸️ 收到，等当前步骤完成后立即处理你的新指令。").catch(() => {});
+    if (activeTasks.has(taskKey)) {
+      activeTasks.get(taskKey).interruptMsg = userContent;
+      console.log(`[interrupt] 存入中断 session=${taskKey}`);
+      await replyToLark(msgId, "看到，我先不丢。你这句我合到当前这轮里，等这步跑完就接着处理。").catch(() => {});
+      await appendTaskLedger("fast_ack_sent", {
+        ...ledgerBase,
+        status: "queued_followup",
+        message_id: msgId,
+      });
+      await appendTaskLedger("progress_status_replied", {
+        ...ledgerBase,
+        status: "queued_followup",
+        progress: 5,
+        message_id: msgId,
+      });
       return;
     }
 
     // ─── 注册任务（群里每个用户独立，天然并发） ──────────────────────────────
-    if (senderOpenId) activeTasks.set(senderOpenId, { interruptMsg: null });
+    activeTasks.set(taskKey, {
+      interruptMsg: null,
+      chatId,
+      senderOpenId,
+      senderSessionKey: taskKey,
+      sourceMessageId: msgId,
+      responseLadderTimers: [],
+      responseLadderPhases: new Set(),
+    });
+
+    const taskPreAckText = buildJingweiTaskPreAckText(userContent, false);
+    let taskPreAckResult = { ok: false, skipped: true, reason: "disabled" };
+    if (TASK_PRE_ACK_ENABLED) {
+      try {
+        taskPreAckResult = await sendTextToChat(chatId, taskPreAckText, TASK_PRE_ACK_SEND_TIMEOUT_MS);
+      } catch (e) {
+        taskPreAckResult = { ok: false, error: e.message };
+        console.error("[task预接话失败]", e.message);
+      }
+    }
+    await appendTaskLedger("task_pre_ack_sent", {
+      ...ledgerBase,
+      status: "received",
+      message_id: taskPreAckResult.message_id || msgId,
+      reply_message_id: taskPreAckResult.message_id || "",
+      reply_ok: Boolean(taskPreAckResult.ok),
+      skipped: Boolean(taskPreAckResult.skipped),
+      text_preview: previewForLedger(plainUserText),
+      reply_preview: previewForLedger(taskPreAckText),
+    });
 
     // 发一张进度卡片（整个任务只更新这一张，不再新发消息）
     try {
-      progressCardId = await createChatCard(chatId, "已收到，正在思考中...", "⏳ 处理中...", "grey");
+      progressCardId = await createChatCard(chatId, buildJingweiAckContent(userContent, msgId), "经纬2号 · 我先看", "blue");
     } catch (e) {
       console.error("[进度卡片失败]", e.message);
     }
     if (!progressCardId) {
       // 降级：卡片失败时用文字 ack
-      replyToLark(msgId, "⏳ 收到，正在处理中...").catch((e) => {
+      await replyToLark(msgId, "收到，我先看。你有硬限制直接补一句；要多等的话，我会直接说清楚卡在哪。").catch((e) => {
         const errEntry = { ts: new Date().toISOString(), stage: "ack", msg_id: msgId?.slice(-8), error: e.message, code: e.code };
         recentErrors.push(errEntry);
         if (recentErrors.length > 20) recentErrors.shift();
         console.error("[ack失败]", JSON.stringify(errEntry));
       });
+      await appendTaskLedger("fast_ack_sent", {
+        ...ledgerBase,
+        status: "text_reply_sent",
+        message_id: msgId,
+        pre_ack_message_id: taskPreAckResult.message_id || "",
+      });
+      await appendTaskLedger("workbench_updated", {
+        ...ledgerBase,
+        status: "ack_visible",
+        progress: 1,
+        message_id: msgId,
+      });
+    } else {
+      await appendTaskLedger("fast_ack_sent", {
+        ...ledgerBase,
+        status: "card_sent",
+        message_id: progressCardId,
+        pre_ack_message_id: taskPreAckResult.message_id || "",
+      });
+      await appendTaskLedger("workbench_updated", {
+        ...ledgerBase,
+        status: "ack_visible",
+        progress: 1,
+        message_id: progressCardId,
+      });
     }
+
+    scheduleResponseLadder({ taskKey, chatId, progressCardId, msgId, userContent, ledgerBase });
 
     // 进度更新：只 PATCH 那张卡片，不发新消息
     const onProgress = async (msg) => {
       if (progressCardId) {
-        await patchChatCard(progressCardId, msg, "⏳ 处理中...", "grey").catch(() => {});
+        await patchChatCard(progressCardId, msg, "经纬2号 · 正在推进", "grey").catch(() => {});
       }
+      await appendTaskLedger("progress_status_replied", {
+        ...ledgerBase,
+        status: "progress_patched",
+        progress: null,
+        message_id: progressCardId || msgId,
+        text_preview: previewForLedger(msg),
+      });
+      await appendTaskLedger("workbench_updated", {
+        ...ledgerBase,
+        status: "progress_visible",
+        message_id: progressCardId || msgId,
+        text_preview: previewForLedger(msg),
+      });
     };
 
     const AGENT_TIMEOUT_MS = 300_000;
@@ -3540,6 +4583,13 @@ app.post("/webhook", async (req, res) => {
     } else {
       await replyToLark(msgId, reply);
     }
+    await appendTaskLedger("final_message_sent", {
+      ...ledgerBase,
+      status: "completed",
+      progress: 100,
+      message_id: progressCardId || msgId,
+      text_preview: previewForLedger(reply),
+    });
   } catch (err) {
     const errEntry = { ts: new Date().toISOString(), stage: "agent", msg_id: msgId?.slice(-8), error: err.message, code: err.code };
     recentErrors.push(errEntry);
@@ -3557,14 +4607,38 @@ app.post("/webhook", async (req, res) => {
         console.error("[回复失败]", replyErr.message);
       }
     }
+    if (ledgerBase) {
+      await appendTaskLedger("final_message_sent", {
+        ...ledgerBase,
+        status: "error",
+        progress: 100,
+        message_id: progressCardId || msgId,
+        error: err.message,
+      });
+    }
   } finally {
     // 任务结束（成功/失败/超时）均清理，释放并发槽位
-    const _sid = body?.event?.sender?.sender_id?.open_id;
-    if (_sid) activeTasks.delete(_sid);
+    if (taskKey) {
+      clearResponseLadderTimers(taskKey);
+      activeTasks.delete(taskKey);
+    }
   }
-});
+}
+
+app.post("/webhook", async (req, res) => handleWebhookBody(req.body, res));
 
 app.get("/", (req, res) => res.send("Lark Claude Bot is running."));
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "jingwei2-webhook",
+    time: new Date().toISOString(),
+    uptime_sec: Math.round(process.uptime()),
+    response_ladder_enabled: !RESPONSE_LADDER_DISABLED,
+    task_pre_ack_enabled: TASK_PRE_ACK_ENABLED,
+  });
+});
 
 // 配置诊断（不暴露值，只显示是否已设置）
 app.get("/config", (req, res) => {
@@ -3634,26 +4708,46 @@ process.on("uncaughtException", (err) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ 服务启动：http://localhost:${PORT}`);
-  // Async startup without blocking the server
-  (async () => {
-    try {
-      if (userAccessToken) {
-        tokenExpiresAt = Date.now() + 3600 * 1000;
-        console.log("✅ 用户 access token 已加载");
-        if (userRefreshToken) {
+
+function startServer() {
+  return app.listen(PORT, () => {
+    console.log(`✅ 服务启动：http://localhost:${PORT}`);
+    // Async startup without blocking the server
+    (async () => {
+      try {
+        if (userAccessToken) {
+          tokenExpiresAt = Date.now() + 3600 * 1000;
+          console.log("✅ 用户 access token 已加载");
+          if (userRefreshToken) {
+            await refreshUserToken();
+          }
+        } else if (userRefreshToken) {
           await refreshUserToken();
+        } else {
+          console.log("⚠️  未配置用户 token，用户级功能不可用");
         }
-      } else if (userRefreshToken) {
-        await refreshUserToken();
-      } else {
-        console.log("⚠️  未配置用户 token，用户级功能不可用");
+      } catch (err) {
+        console.error("[启动 Token 刷新失败]", err.message);
       }
-    } catch (err) {
-      console.error("[启动 Token 刷新失败]", err.message);
-    }
-    // 获取 bot open_id 用于群聊 @判断
-    await fetchBotInfo().catch(err => console.error("[fetchBotInfo 失败]", err.message));
-  })();
-});
+      // 获取 bot open_id 用于群聊 @判断
+      await fetchBotInfo().catch(err => console.error("[fetchBotInfo 失败]", err.message));
+    })();
+  });
+}
+
+if (process.env.NODE_ENV !== "test" && process.argv[1] === __filename) {
+  startServer();
+}
+
+export {
+  app,
+  startServer,
+  handleWebhookBody,
+  submitVideoProject,
+  normalizeVideoRatio,
+  normalizeVideoDuration,
+  enforceVideoPromptConstraints,
+  isExplicitNonVideoCorrectionText,
+  inferResponseRouteForUser,
+  buildJingweiTaskPreAckText,
+};
