@@ -1345,11 +1345,11 @@ function stripJingweiBotMentionText(text = "") {
     .trim();
 }
 
-function buildJingweiAckContent(userContent, messageId = "") {
+function buildJingweiAckContent(userContent, messageId = "", preComputedRoute = null) {
   if (looksLikePresalesLeadEmailText(plainTextFromUserContent(userContent))) {
     return buildPresalesLeadAckContent(userContent);
   }
-  const route = inferResponseRouteForUser(userContent);
+  const route = preComputedRoute || inferResponseRouteForUser(userContent);
   const preview = userVisibleRequestPreview(userContent);
   return sanitizeUserVisibleText([
     `收到，我先看你这条：${preview}`,
@@ -1359,32 +1359,89 @@ function buildJingweiAckContent(userContent, messageId = "") {
   ].filter(Boolean).join("\n"));
 }
 
-function buildJingweiTaskPreAckText(userContent, queued = false) {
+function buildJingweiTaskPreAckText(userContent, queued = false, preComputedRoute = null) {
   if (looksLikePresalesLeadEmailText(plainTextFromUserContent(userContent)) && !queued) {
     return sanitizeUserVisibleText("收到，我直接出待确认邮件草稿；确认前不外发。");
   }
-  const route = inferResponseRouteForUser(userContent);
+  const route = preComputedRoute || inferResponseRouteForUser(userContent);
   if (queued) {
     return sanitizeUserVisibleText("收到，这句我合到当前这轮里，不另开。你有硬限制继续补，我接着往下推。");
   }
   return sanitizeUserVisibleText(`收到，我先看。这个我先按${routeHumanPhrase(route)}接住；你有硬限制直接补一句，我会并进去。`);
 }
 
+async function classifyIntentWithLLM(plainText) {
+  const text = String(plainText || "").trim();
+
+  // task_control 必须同步拦截，它走的是完全不同的代码路径
+  if (getTaskControlIntent(text)) {
+    return {
+      label: "当前任务状态/控制",
+      firstAction: "先查当前会话里的活跃任务和等待任务，再决定是列状态还是清空。",
+      supplement: "直接说清空、取消、看状态或继续哪一个任务。",
+      secondState: "我会只处理当前会话和当前用户相关的任务，不跨群、不误触发视频。",
+      confirmation: "清空当前会话等待任务，还是只看任务状态。",
+      nextAction: "先处理任务状态，不进入视频、生成或邮件链路。",
+      fastPhrase: "清空当前任务",
+      taskKind: "task_control",
+    };
+  }
+
+  try {
+    const resp = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 350,
+      temperature: 0,
+      system: `你是「经纬2号」飞书助手的意图分类器。理解消息的真实意图，返回 JSON。
+
+可选 taskKind：
+- onboarding   新人入职、了解部门业务/流程/岗位职责、熟悉团队
+- video        视频生产/剪辑/成片/分镜/口播/Seedance/Kling
+- content_ops  内容运营、选题排期、投放数据、运营表
+- feishu       飞书文档/表格/知识库/消息/云文档操作
+- presales     售前跟进、外联邮件、客户开发、留资
+- ppt_doc      PPT/演示文稿/汇报/提案方案
+- brand_hero_video  品牌宣传片/Hero Video/Remotion
+- customer_outreach 客户邮件/沟通跟进
+- visual       图片/视觉/海报/素材设计
+- general      以上都不符合的综合任务
+
+注意：即使消息中包含"内容""运营"等词，如果核心意图是新人了解部门/业务/岗位，应分类为 onboarding。
+
+只返回 JSON（无其他文字）：
+{
+  "taskKind": "<类型>",
+  "label": "<中文标签，不超过10字>",
+  "firstAction": "<第一步行动，30字内>",
+  "supplement": "<用户可以补充的信息>",
+  "secondState": "<第二步状态说明>",
+  "confirmation": "<需用户确认的核心问题>",
+  "nextAction": "<下一步动作>",
+  "fastPhrase": "<加速短语，4-6字>"
+}`,
+      messages: [{ role: "user", content: text.slice(0, 500) }],
+    });
+
+    const raw = resp.content[0]?.text || "";
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (match) {
+      const result = JSON.parse(match[0]);
+      if (result.taskKind) {
+        console.log(`[LLM路由] ${result.taskKind} — ${result.label}`);
+        return result;
+      }
+    }
+  } catch (e) {
+    console.error("[LLM路由] Haiku分类失败，降级到规则路由:", e.message);
+  }
+
+  // 降级：走原来的关键词规则路由
+  return inferResponseRouteForUser(text);
+}
+
 function inferResponseRouteForUser(userContent) {
   const text = plainTextFromUserContent(userContent);
   const compact = String(text || "").toLowerCase();
-  if (/新人|实习生|入职|onboarding|刚加入|刚入职|了解部门|了解业务|带我入门|我是新来的|第一天|第一周/.test(compact)) {
-    return {
-      label: "新人入职引导",
-      firstAction: "直接从内置入职知识库回答，不调用任何工具，先问清楚岗位方向再提供定制化引导。",
-      supplement: "告诉我你是内容运营、商务销售、还是产品技术方向，我给你最适合的学习路线。",
-      secondState: "我会介绍团队业务、生产流程、日常任务类型和主要客户，不需要搜索飞书文档。",
-      confirmation: "先告诉我你的岗位方向，A内容运营 B商务销售 C产品技术 D先全面了解。",
-      nextAction: "先问诊岗位，再提供定制化入职路线和业务知识。",
-      fastPhrase: "先介绍团队业务",
-      taskKind: "onboarding",
-    };
-  }
   if (getTaskControlIntent(text)) {
     return {
       label: "当前任务状态/控制",
@@ -1565,8 +1622,8 @@ function inferResponseRouteForUser(userContent) {
   };
 }
 
-function buildJingweiResponseLadderContent(phase, userContent) {
-  const route = inferResponseRouteForUser(userContent);
+function buildJingweiResponseLadderContent(phase, userContent, preComputedRoute = null) {
+  const route = preComputedRoute || inferResponseRouteForUser(userContent);
   if (phase === "fourth") {
     return {
       title: responseLadderTitleForRoute("fourth", route),
@@ -1627,7 +1684,7 @@ async function sendResponseLadderUpdate({ phase, taskKey, chatId, progressCardId
   if (task.responseLadderPhases.has(phase)) return false;
   task.responseLadderPhases.add(phase);
 
-  const { title, content, color } = buildJingweiResponseLadderContent(phase, userContent);
+  const { title, content, color } = buildJingweiResponseLadderContent(phase, userContent, task.route || null);
   let messageId = progressCardId || msgId;
   let deliveryStatus = "patched";
   if (progressCardId) {
@@ -5106,7 +5163,7 @@ async function handleWebhookBody(body, res) {
     }
 
     // ─── 注册任务（群里每个用户独立，天然并发） ──────────────────────────────
-    const responseRoute = inferResponseRouteForUser(userContent);
+    const responseRoute = await classifyIntentWithLLM(plainUserText);
     activeTasks.set(taskKey, {
       interruptMsg: null,
       chatId,
@@ -5123,7 +5180,7 @@ async function handleWebhookBody(body, res) {
       responseLadderPhases: new Set(),
     });
 
-    const taskPreAckText = buildJingweiTaskPreAckText(userContent, false);
+    const taskPreAckText = buildJingweiTaskPreAckText(userContent, false, responseRoute);
     let taskPreAckResult = { ok: false, skipped: true, reason: "disabled" };
     if (TASK_PRE_ACK_ENABLED) {
       try {
@@ -5147,7 +5204,7 @@ async function handleWebhookBody(body, res) {
     // 发一张进度卡片（整个任务只更新这一张，不再新发消息）
     try {
       const progressTitle = looksLikePresalesLeadEmailText(plainTextFromUserContent(userContent)) ? "售前留资邮件待确认" : "经纬2号 · 我先看";
-      progressCardId = await createChatCard(chatId, buildJingweiAckContent(userContent, msgId), progressTitle, "blue");
+      progressCardId = await createChatCard(chatId, buildJingweiAckContent(userContent, msgId, responseRoute), progressTitle, "blue");
       const task = activeTasks.get(taskKey);
       if (task) {
         task.progressCardId = progressCardId || null;
@@ -5375,7 +5432,6 @@ app.get("/test-api", async (req, res) => {
 // Local proxy self-registration — called by start-proxy.sh when tunnel URL changes
 let dynamicProxyUrl = "";
 // ── Skills Admin API ──────────────────────────────────────────────────────────
-import { createReadStream } from "fs";
 import { readFile as readFileAsync } from "fs/promises";
 
 const SKILLS_REGISTRY_PATH = path.join(os.homedir(), ".claude", "skills-registry.json");
