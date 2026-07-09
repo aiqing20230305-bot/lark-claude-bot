@@ -910,10 +910,11 @@ async function getChats() {
 }
 
 async function sendMessage(chatId, text) {
+  const safeText = sanitizeUserVisibleText(text, { preserveEmails: shouldPreserveUserVisibleEmail(text) });
   const data = await botApiCall("/open-apis/im/v1/messages?receive_id_type=chat_id", "POST", {
     receive_id: chatId,
     msg_type: "text",
-    content: JSON.stringify({ text }),
+    content: JSON.stringify({ text: safeText }),
   });
   return data.code === 0 ? "消息发送成功" : `发送失败: ${data.msg}`;
 }
@@ -938,28 +939,53 @@ async function getMessages(chatId, pageSize = 20) {
 }
 
 async function sendDirectMessage(openId, text) {
+  const safeText = sanitizeUserVisibleText(text, { preserveEmails: shouldPreserveUserVisibleEmail(text) });
   const data = await botApiCall("/open-apis/im/v1/messages?receive_id_type=open_id", "POST", {
     receive_id: openId,
     msg_type: "text",
-    content: JSON.stringify({ text }),
+    content: JSON.stringify({ text: safeText }),
   });
   return data.code === 0 ? "消息发送成功" : `发送失败: ${data.msg}`;
 }
 
-function plainTextFromUserContent(userContent) {
-  if (typeof userContent === "string") return userContent;
-  if (Array.isArray(userContent)) {
-    return userContent
-      .filter(item => item?.type === "text")
-      .map(item => item.text || "")
-      .join(" ")
-      .trim();
+function contentItemToPlainText(item) {
+  if (!item) return "";
+  if (typeof item === "string") return item;
+  if (Array.isArray(item)) return item.map(contentItemToPlainText).filter(Boolean).join(" ");
+  if (typeof item !== "object") return "";
+  const pieces = [];
+  for (const key of ["text", "content", "href", "url", "link", "name"]) {
+    const value = item[key];
+    if (typeof value === "string") pieces.push(value);
+    else if (Array.isArray(value) || (value && typeof value === "object")) pieces.push(contentItemToPlainText(value));
   }
-  return "";
+  return pieces.filter(Boolean).join(" ");
 }
 
-function sanitizeUserVisibleText(value) {
-  return String(value || "")
+function plainTextFromUserContent(userContent) {
+  if (typeof userContent === "string") return userContent;
+  if (Array.isArray(userContent)) return userContent.map(contentItemToPlainText).filter(Boolean).join(" ").trim();
+  return contentItemToPlainText(userContent).trim();
+}
+
+function shouldPreserveUserVisibleEmail(value) {
+  return /售前留资|官网留资|Clipo\s*官网|确认发送售前留资邮件|售前留资邮件待确认|Clipo\s*团队/i.test(String(value || ""));
+}
+
+function redactSensitiveUserVisibleText(value, { preserveEmails = false } = {}) {
+  let text = String(value || "");
+  if (!preserveEmails) {
+    text = text.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[邮箱已隐藏]");
+  }
+  return text
+    .replace(/(?<![\w])\+?\d[\d\s().-]{8,}\d(?![\w])/g, (raw) => {
+      const digits = raw.replace(/\D/g, "");
+      return digits.length >= 10 ? "[手机号已隐藏]" : raw;
+    });
+}
+
+function sanitizeUserVisibleText(value, options = {}) {
+  return redactSensitiveUserVisibleText(value, options)
     .replace(/\b(sender_open_id|sender_session_key|request_message_id|source_message_id|original_message_id|reply_message_id|message_id|open_id|chat_id|taskKey|ledger|task-ledger)\b[:：]?\s*[A-Za-z0-9_:-]*/gi, "相关信息")
     .replace(/\b(om|oc|ou)_[A-Za-z0-9_-]{6,}\b/g, "相关信息")
     .replace(/(?:\/Users|\/private|\/tmp|tmp\/jw2-assets)\/[^\s，。；、)）]+/g, "相关文件")
@@ -982,7 +1008,7 @@ function isExplicitNonVideoCorrectionText(text) {
   return (
     /(?:不是|不属于|并不是|并非|没关系|无关)(?:.*)(?:视频|成片|剪辑|Seedance|seedance|生成视频|视频生成)/.test(compact)
     || /(?:视频|成片|剪辑|Seedance|seedance|生成视频|视频生成)(?:.*)(?:没关系|无关|不是|不属于|并非)/.test(compact)
-    || /(?:不需要视频|不用视频|不要视频)/.test(compact)
+    || /(?:不需要视频|不用视频|不要视频|不走视频|别走视频|不要走视频|不要走视频生成|不走视频生成|别走视频生成|别生成视频|不要生成视频)/.test(compact)
   );
 }
 
@@ -993,8 +1019,136 @@ function looksLikeContentOpsLookupText(text) {
   return business && lookup;
 }
 
+
+
+
+
+
+
+
+
+
+// -- presales lead email hotfix: start --
+function looksLikePresalesLeadEmailText(text) {
+  const compact = String(text || "");
+  const base = /售前留资|官网留资|Clipo官网-留资提醒|Clipo 官网|Clipo 留资|触发售前留资|生成跟进邮件|确认发送售前留资邮件|修改这封售前留资邮件|clipo\.support@tezign\.com/i.test(compact);
+  const revision = /你填的场景是|邮件草稿|正文草稿|确认发送口令|Clipo 团队|让创作回到想象|这封邮件|这句/.test(compact) && /改|删|错|多余|重复|语气|重写|调整|不要|去掉|换成|更/.test(compact);
+  return base || revision;
+}
+
+function looksLikePresalesShortSendConfirmation(text) {
+  const compact = String(text || "").replace(/\s+/g, "");
+  return /^(确认发送|确认发出|可以发送|发送)$/.test(compact) || /用户点击了卡片按钮.*确认发送/.test(compact);
+}
+
+const PRESALES_EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+
+function normalizePresalesEmailSource(value) {
+  return String(value || "")
+    .replace(/[［]/g, "[")
+    .replace(/[］]/g, "]")
+    .replace(/[（]/g, "(")
+    .replace(/[）]/g, ")")
+    .replace(/mailto\s*:\s*/gi, " ")
+    .replace(/\]\s*\(\s*/g, " ")
+    .replace(/[<>\[\]()`"']/g, " ");
+}
+
+function extractPresalesValidEmail(value) {
+  const match = normalizePresalesEmailSource(value).match(PRESALES_EMAIL_RE);
+  return match ? match[0] : "";
+}
+
+function pickPresalesLeadField(text, labels) {
+  const allLabels = "姓名|客户姓名|name|邮箱|email|场景|使用场景|需求|用途|scenario|备注|补充|语气|note";
+  const labelGroup = Array.isArray(labels) ? labels.join("|") : String(labels || "");
+  const pattern = new RegExp("(?:^|[\\s\\n\\r])(?:" + labelGroup + ")\\s*[:：]\\s*([\\s\\S]*?)(?=\\s+(?:" + allLabels + ")\\s*[:：]|\\n|\\r|$)", "i");
+  const match = String(text || "").match(pattern);
+  return match ? String(match[1] || "").trim().replace(/[，,。；;]+$/g, "") : "";
+}
+
+function parsePresalesLeadEmailFields(value) {
+  const text = plainTextFromUserContent(value);
+  const emailField = pickPresalesLeadField(text, ["邮箱", "email"]);
+  const email = extractPresalesValidEmail(text) || extractPresalesValidEmail(emailField) || emailField;
+  const name = pickPresalesLeadField(text, ["姓名", "客户姓名", "name"]);
+  const scenario = pickPresalesLeadField(text, ["场景", "使用场景", "需求", "用途", "scenario"]);
+  const note = pickPresalesLeadField(text, ["备注", "补充", "语气", "note"]);
+  const isRevision = looksLikePresalesLeadEmailText(text) && /改|删|错|多余|重复|语气|重写|调整|不要|去掉|换成|更/.test(text) && !/(触发售前留资|姓名\s*[:：]|邮箱\s*[:：])/.test(text);
+  const emailValid = PRESALES_EMAIL_RE.test(email) && email === extractPresalesValidEmail(email);
+  const testEmail = /@(example|test|demo)\./i.test(email);
+  return { text, name, email, scenario, note, emailValid, testEmail, isRevision };
+}
+
+function buildPresalesLeadAckContent(userContent) {
+  const fields = parsePresalesLeadEmailFields(userContent);
+  if (fields.isRevision && (!fields.name || !fields.email || !fields.scenario)) {
+    return [
+      "【售前留资修改已接收】",
+      "我会按你的修改意见重写上一版售前邮件，确认前不外发。",
+      "修改点：" + String(fields.text || "").slice(0, 120)
+    ].join("\n");
+  }
+  const missing = [];
+  if (!fields.name) missing.push("姓名");
+  if (!fields.scenario) missing.push("场景");
+  if (!fields.email || !fields.emailValid) missing.push("完整邮箱");
+  if (missing.length) {
+    return [
+      "【售前留资待补充】",
+      "缺少或异常字段：" + missing.join("、"),
+      fields.email ? "当前邮箱字段不是完整邮箱：" + fields.email : "缺少邮箱字段。",
+      "补齐姓名 / 邮箱 / 场景后，我直接出待确认邮件草稿；确认前不外发。"
+    ].join("\n");
+  }
+  const subject = "关于你在 Clipo 留下的「" + fields.scenario + "」需求";
+  const testNotice = fields.testEmail ? "\n测试邮箱识别：当前是 example/test/demo 域名；短确认不会外发，完整确认口令会尝试发送，用于验证失败回执。" : "";
+  return [
+    "【售前留资邮件待确认】",
+    "",
+    "线索",
+    "- 来源：Clipo 官网售前留资",
+    "- 姓名：" + fields.name,
+    "- 邮箱：" + fields.email,
+    "- 场景：" + fields.scenario,
+    fields.note ? "- 备注：" + fields.note : "",
+    "",
+    "判断",
+    "- 适配：自助试用优先，回复后再判断是否转内容运营服务",
+    "- 边界：确认前不外发，不承诺结果",
+    "",
+    "邮件主题",
+    subject,
+    "",
+    "邮件正文",
+    "Hi " + fields.name + "，",
+    "你好！我们是 Clipo 团队，看到你在官网留下了联系方式，特意来打个招呼。",
+    "你关注的是「" + fields.scenario + "」。这个方向里，大家常卡在素材分散、爆款结构难复用、脚本和剪辑节奏跟不上。",
+    "所以想先简单了解一下：你主要服务哪类品牌或产品？现在最耗时间的是选题、写脚本，还是找素材剪辑？平均一周大概要交付多少条？",
+    "如果你想先自己掌控生产流程，可以直接试用 Clipo：把一条参考视频丢进来，它会帮你拆结构，并结合自己的素材生成差异化版本。注册即送 50 点数免费体验：https://clipo.cc/",
+    "如果你更想直接看到投放或交付结果，我们也有配套内容运营服务，从选题、脚本到成片和数据反馈一起跟进。",
+    "两条路不冲突，你可以先试用产品感受一下，再决定是否需要更深度的服务支持。期待你的回复！",
+    "",
+    "Clipo 团队",
+    "让创作回到想象的素材 | 你的内容生产智能体",
+    "https://clipo.cc/",
+    testNotice,
+    "",
+    "操作",
+    "- 要改：直接说修改点",
+    "- 要发：确认发送售前留资邮件 + " + fields.email,
+    "- 测试域名：短确认不发；完整确认会尝试发送以验证失败路径"
+  ].filter(Boolean).join("\n");
+}
+// -- presales lead email hotfix: end --
+
 function routeHumanPhrase(route = {}) {
   const label = route.label || "";
+  if (/售前留资|官网留资/.test(label) || route.taskKind === "presales_lead_email") return "Clipo 官网售前留资邮件转化";
+  if (route.taskKind === "task_control") return "当前任务状态";
+  if (route.taskKind === "generation_provider_fallback") return "生成能力兜底这条线";
+  if (route.taskKind === "brand_hero_video") return "品牌 Hero Video 这条线";
+  if (/客户|邮件|外联/.test(label)) return "客户跟进这条线";
   if (/视频|剪辑/.test(label)) return "视频这条线";
   if (/PPT|汇报/.test(label)) return "PPT这条线";
   if (/飞书/.test(label)) return "飞书资料这条线";
@@ -1007,10 +1161,65 @@ function compactRouteAction(route = {}) {
   return sanitizeUserVisibleText(route.nextAction || route.secondState || route.firstAction || "我先给你一版能确认的方向。");
 }
 
+function responseLadderTitleForRoute(phase, route = {}) {
+  const kind = route.taskKind || "general";
+  const titles = {
+    presales_lead_email: {
+      first: "经纬2号 · 售前留资我接住了",
+      second: "经纬2号 · 售前留资邮件在处理",
+      third: "经纬2号 · 售前留资确认点",
+      fourth: "经纬2号 · 售前留资下一步",
+    },
+    customer_outreach: {
+      second: "经纬2号 · 客户邮件继续推进",
+      third: "经纬2号 · 客户邮件确认点",
+      fourth: "经纬2号 · 客户邮件下一步",
+    },
+    content_ops: {
+      second: "经纬2号 · 内容运营查询继续推进",
+      third: "经纬2号 · 内容运营查询确认点",
+      fourth: "经纬2号 · 内容运营下一步",
+    },
+    brand_hero_video: {
+      first: "经纬2号 · Brand Hero 我接住了",
+      second: "经纬2号 · Brand Hero 推荐路径",
+      third: "经纬2号 · Brand Hero 确认点",
+      fourth: "经纬2号 · Brand Hero 下一步",
+    },
+    generation_provider_fallback: {
+      first: "经纬2号 · 生成链路我接住了",
+      second: "经纬2号 · 生成链路兜底方案",
+      third: "经纬2号 · 生成链路确认点",
+      fourth: "经纬2号 · 生成链路下一步",
+    },
+  };
+  if (phase === "first") return titles[kind]?.first || "经纬2号 · 我先接住";
+  return titles[kind]?.[phase] || `经纬2号 · ${routeHumanPhrase(route)}继续推进`;
+}
+
+function responseLadderTaskLine(route = {}) {
+  if (route.taskKind === "presales_lead_email") {
+    return "我在处理的是 Clipo 官网售前留资邮件：先确认邮件草稿、收件人和发送门槛；确认前不外发。";
+  }
+  if (route.taskKind === "customer_outreach") {
+    return "我在处理的是客户跟进/邮件任务：先把客户线索、痛点和下一步沟通拆清楚。";
+  }
+  if (route.taskKind === "content_ops") {
+    return "我在处理的是内容运营查询：先核对表和上下文，再给结论，不拿旧表当确定结果。";
+  }
+  if (route.taskKind === "brand_hero_video") {
+    return "我在处理的是品牌 Hero Video：先抓品牌主张和旁白时间轴，再决定 Remotion、HyperFrames、Seedance 和声音包怎么并行。";
+  }
+  if (route.taskKind === "generation_provider_fallback") {
+    return "我在处理的是生成链路兜底：先判断真实镜头、口播和 BGM 分别走哪个可用供应商，再给可执行路径。";
+  }
+  return `我在处理的是${routeHumanPhrase(route)}，会先给你可确认的下一步。`;
+}
+
 function hasExplicitExecutionConsent(text) {
   const compact = String(text || "");
   if (/不要生成|别生成|不消耗|不要消耗|不要执行|no-spend|no spend/i.test(compact)) return false;
-  return /确认执行|可以执行|开始执行|直接开始|直接生成|开始生成|不用问|不用确认|按这个执行|按计划执行|就按这个来|同意|确认可以|可以生成|开跑|CONFIRM_SEND_TO_FEISHU/i.test(compact);
+  return /确认执行|可以执行|开始执行|直接开始|直接生成|开始生成|不用问|不用确认|按这个执行|按计划执行|就按这个来|往下执行|继续执行|继续往下|继续做|继续推进|按这个做|按这个来|就这么做|可以继续|同意|确认可以|可以生成|开跑|CONFIRM_SEND_TO_FEISHU/i.test(compact);
 }
 
 function isTaskLikeText(text) {
@@ -1024,12 +1233,49 @@ function isLightweightInteractionText(text) {
   const compact = String(text || "").trim();
   if (!compact || compact.length > 120) return false;
   if (hasExplicitExecutionConsent(compact)) return false;
+  if (getTaskControlIntent(compact)) return true;
   if (isTaskLikeText(compact)) return false;
-  return /在吗|在不在|你好|嗨|hi|hello|hey|你是谁|你是啥|你能做什么|能做什么|怎么用|可以做什么|怎么跟你聊|谢谢|谢了|辛苦|收到没|慢|太慢|反应慢|回复慢|没反应|互动|像经纬|口吻|语气/i.test(compact);
+  return /在吗|在不在|你好|嗨|hi|hello|hey|你是谁|你是啥|你能做什么|能做什么|怎么用|可以做什么|怎么跟你聊|谢谢|谢了|辛苦|收到没|慢|太慢|反应慢|回复慢|没反应|不回复|没回复|为什么不回|为什么没回|群里|群聊|互动|像经纬|口吻|语气/i.test(compact);
+}
+
+function getTaskControlIntent(text) {
+  const compact = String(text || "").trim();
+  if (!compact) return "";
+  const normalized = compact.toLowerCase();
+  const hasTaskWord = /任务|等待|活跃|队列|处理中|当前|目前|卡住|死循环|重复回复|状态|进度/.test(compact);
+  if (hasTaskWord && /清空|清除|取消|停止|终止|关闭|重置|不要继续|别继续|别跑|停掉/.test(compact)) return "clear";
+  if (/清空.*任务|清除.*任务|取消.*任务|停止.*任务|clear.*task|cancel.*task|stop.*task/i.test(normalized)) return "clear";
+  if (hasTaskWord && /还有多少|有几个|多少个|为什么.*多|怎么.*多|查一下|看一下|看下|列一下|现在|当前|目前|状态|进度|跑到哪|到哪/.test(compact)) return "status";
+  if (/active tasks|pending tasks|task status|queue status/i.test(normalized)) return "status";
+  return "";
+}
+
+function looksLikeGenerationProviderFallbackText(text) {
+  const compact = String(text || "").toLowerCase();
+  if (!compact) return false;
+  const quotaSignal = /没额度|没有额度|额度不足|额度不够|quota|credits|api没有额度|api 没有额度|生成类api|生成类 api|供应商不可用|provider fallback/.test(compact);
+  const providerSignal = /ai studio|aistudio|seedance\s*2|seedance2|seedance 2\.0|口播|旁白|配音|语音|bgm|背景音乐|配乐|音乐/.test(compact);
+  return quotaSignal || (providerSignal && /fallback|兜底|降级|切换|改到|走\s*ai|走\s*seedance/.test(compact));
+}
+
+function looksLikeBrandHeroVideoText(text) {
+  const compact = String(text || "").toLowerCase();
+  if (!compact || isExplicitNonVideoCorrectionText(text)) return false;
+  return /brand-hero-video|brand hero|hero video|品牌\s*hero|品牌宣传片|品牌短片|品牌片|产品发布短片|产品发布片|官网\s*hero|官网宣传片|网站转宣传片|launch film|brand film/.test(compact);
+}
+
+function isGroupReplyRuleQuestion(text) {
+  const compact = String(text || "").trim();
+  if (!compact) return false;
+  return /(群里|群聊|群消息|群里的聊天|群里的消息)/.test(compact) &&
+    /(不回复|没回复|不回|没回|没反应|为什么|怎么叫你|怎么喊你)/.test(compact);
 }
 
 function buildJingweiInstantReply(text) {
   const compact = String(text || "").trim();
+  if (isGroupReplyRuleQuestion(compact)) {
+    return "我在。\n群里我会守规矩：没点真实 @经纬2号 / @智能体，我就不插话，免得把大家闲聊都变成任务。\n你要我处理群里的事，直接在群里 @ 我加一句目标，我就接。";
+  }
   if (/慢|反应慢|回复慢|没反应|互动/.test(compact)) {
     return "对，这个体验不能慢。\n我会先回一句把事接住，再边做边把能确定的先抛出来；真卡住就直接说卡在哪。你补一句限制或改法，我会并进这轮。";
   }
@@ -1094,11 +1340,14 @@ function messageMentionsJingweiBot(message = {}) {
 function stripJingweiBotMentionText(text = "") {
   return String(text || "")
     .replace(/@\s*(经纬\s*2号|经维\s*2号|经纬二号|智能体|jingwei\s*2|jingwei2|jw2)[\s:：，,]*/gi, "")
-    .replace(/@[^\s]+\s*/g, "")
+    .replace(/(^|\s)@[^\s@]+\s*/g, "$1")
     .trim();
 }
 
 function buildJingweiAckContent(userContent, messageId = "") {
+  if (looksLikePresalesLeadEmailText(plainTextFromUserContent(userContent))) {
+    return buildPresalesLeadAckContent(userContent);
+  }
   const route = inferResponseRouteForUser(userContent);
   const preview = userVisibleRequestPreview(userContent);
   return sanitizeUserVisibleText([
@@ -1110,6 +1359,9 @@ function buildJingweiAckContent(userContent, messageId = "") {
 }
 
 function buildJingweiTaskPreAckText(userContent, queued = false) {
+  if (looksLikePresalesLeadEmailText(plainTextFromUserContent(userContent)) && !queued) {
+    return sanitizeUserVisibleText("收到，我直接出待确认邮件草稿；确认前不外发。");
+  }
   const route = inferResponseRouteForUser(userContent);
   if (queued) {
     return sanitizeUserVisibleText("收到，这句我合到当前这轮里，不另开。你有硬限制继续补，我接着往下推。");
@@ -1120,6 +1372,43 @@ function buildJingweiTaskPreAckText(userContent, queued = false) {
 function inferResponseRouteForUser(userContent) {
   const text = plainTextFromUserContent(userContent);
   const compact = String(text || "").toLowerCase();
+  if (getTaskControlIntent(text)) {
+    return {
+      label: "当前任务状态/控制",
+      firstAction: "先查当前会话里的活跃任务和等待任务，再决定是列状态还是清空。",
+      supplement: "直接说清空、取消、看状态或继续哪一个任务。",
+      secondState: "我会只处理当前会话和当前用户相关的任务，不跨群、不误触发视频。",
+      confirmation: "清空当前会话等待任务，还是只看任务状态。",
+      nextAction: "先处理任务状态，不进入视频、生成或邮件链路。",
+      fastPhrase: "清空当前任务",
+      taskKind: "task_control",
+    };
+  }
+  if (looksLikePresalesLeadEmailText(text)) {
+    return {
+      label: "售前留资邮件自动化",
+      firstAction: "先提取官网留资字段，再生成一封待确认售前跟进邮件。",
+      supplement: "补姓名、完整邮箱、场景、语气或修改意见。",
+      secondState: "我会把线索字段、适配判断、主题、正文和发送口令一次说清楚。",
+      confirmation: "先生成草稿，确认发送必须另说确认发送售前留资邮件加邮箱。",
+      nextAction: "先出待确认邮件草稿，确认前不外发。",
+      fastPhrase: "先出售前邮件草稿",
+      taskKind: "presales_lead_email",
+    };
+  }
+  const visualRequested = /图片|海报|视觉|封面|配图|素材|参考图|image|logo/.test(compact);
+  if (/邮件|email|客户|留咨|留资|官网|connect|转化|跟进|外联|商务邮件|客户痛点|投放目的|演示|individual creator|affiliate/i.test(text)) {
+    return {
+      label: "客户跟进/邮件任务",
+      firstAction: "先读产品资料和客户线索，再给一封可直接改的外联邮件。",
+      supplement: "补客户身份、语气、中文/英文、是否约演示，或直接说先出邮件草稿。",
+      secondState: "我会把客户背景、可能痛点、邮件目标和下一步沟通拆开。",
+      confirmation: "先出邮件草稿，还是先提炼客户痛点和沟通提纲。",
+      nextAction: "先给一封能改的邮件草稿，重点问投放目的、生产痛点和下一步沟通。",
+      fastPhrase: "先出邮件草稿",
+      taskKind: "customer_outreach",
+    };
+  }
   if (looksLikeContentOpsLookupText(text)) {
     return {
       label: "内容运营/资料查询",
@@ -1129,6 +1418,19 @@ function inferResponseRouteForUser(userContent) {
       confirmation: "先只读核对，还是允许我整理成更新建议。",
       nextAction: "先给你查表结论和差异点；需要写入前会单独问你。",
       fastPhrase: "先查内容运营表",
+      taskKind: "content_ops",
+    };
+  }
+  if (visualRequested && isExplicitNonVideoCorrectionText(text)) {
+    return {
+      label: "图片/视觉任务",
+      firstAction: "先看图片里的主体、信息、用途和限制，给你一版视觉判断。",
+      supplement: "补图片用途、目标平台、画幅、要保留/要删除的内容，或说先给视觉判断。",
+      secondState: "我会先给图片理解和可执行方向，再判断是否需要改图、配图或素材包。",
+      confirmation: "先看图给判断，还是直接整理成视觉修改点。",
+      nextAction: "先把图片信息和视觉方向讲清楚。",
+      fastPhrase: "先看图给判断",
+      taskKind: "visual",
     };
   }
   if (isExplicitNonVideoCorrectionText(text)) {
@@ -1140,9 +1442,34 @@ function inferResponseRouteForUser(userContent) {
       confirmation: "回到刚才的问题查资料，还是直接让我给一版修正结论。",
       nextAction: "先回到原问题，不进入视频生成、剪辑或额度流程。",
       fastPhrase: "回到刚才问题",
+      taskKind: "correction",
     };
   }
-  if (/视频|成片|剪辑|脚本|分镜|镜头|口播|字幕|bgm|seedance|hyperframes|remotion/.test(compact)) {
+  if (looksLikeGenerationProviderFallbackText(text)) {
+    return {
+      label: "生成能力兜底/音频与视频路由",
+      firstAction: "先把真实镜头、口播和 BGM 拆开判断：真实镜头优先 Seedance 2.0，口播和背景音乐优先 AI Studio 授权链路。",
+      supplement: "补是否允许用 AI Studio、是否已有授权音乐、是否需要真实镜头，或直接说先给兜底路线。",
+      secondState: "我会先判断当前可用额度和环境，再给一条不乱消耗额度的执行路线。",
+      confirmation: "先只出兜底路线，还是确认后直接执行可用供应商。",
+      nextAction: "先给生成链路兜底判断；没有授权或额度时只停在 blocker，不假装完成。",
+      fastPhrase: "先给兜底路线",
+      taskKind: "generation_provider_fallback",
+    };
+  }
+  if (looksLikeBrandHeroVideoText(text)) {
+    return {
+      label: "Brand Hero Video/品牌宣传片",
+      firstAction: "先抓品牌主张、首屏价值和旁白时间轴，再用 Remotion/HyperFrames 做包装；需要真实镜头时并行走 Seedance 2.0。",
+      supplement: "补官网链接、品牌调性、目标平台、口播/BGM 偏好，或直接说先给推荐路径。",
+      secondState: "我会先给玩法和最推荐路径，不只说流程；声音包和真实镜头会分开确认。",
+      confirmation: "先确认推荐路径，还是直接进入 no-spend 计划稿。",
+      nextAction: "先给品牌 Hero 的推荐玩法和可执行路径；确认前不外发、不消耗额度。",
+      fastPhrase: "先给 Brand Hero 路线",
+      taskKind: "brand_hero_video",
+    };
+  }
+  if (/视频|成片|剪辑|分镜|镜头|口播|字幕|bgm|seedance|hyperframes|remotion/.test(compact)) {
     return {
       label: "视频/剪辑任务",
       firstAction: "先把目标、脚本分段、镜头画面、素材来源、比例和交付形态拆开；有脚本时优先用画面卡对齐，不把大段文字直接塞进视频。",
@@ -1151,6 +1478,7 @@ function inferResponseRouteForUser(userContent) {
       confirmation: "先看分镜确认，还是直接进入成片路线。",
       nextAction: "先给你可确认的脚本分段和镜头建议；涉及生成额度前会停下来问你。",
       fastPhrase: "按这个方向先出分镜",
+      taskKind: "video",
     };
   }
   if (/ppt|deck|幻灯片|演示|提案|汇报/.test(compact)) {
@@ -1162,6 +1490,7 @@ function inferResponseRouteForUser(userContent) {
       confirmation: "先确认目录逻辑，还是直接做成可编辑稿。",
       nextAction: "先给你可改的大纲和页面结构，再进入生成/上传。",
       fastPhrase: "先按这个做目录",
+      taskKind: "ppt_doc",
     };
   }
   if (/内容运营|运营表|运营排期|内容表|backlog|Backlog|选题|热点|投放|案例/.test(compact)) {
@@ -1173,6 +1502,7 @@ function inferResponseRouteForUser(userContent) {
       confirmation: "先只读核对，还是允许我整理成更新建议。",
       nextAction: "先给你查表结论和差异点；需要写入前会单独问你。",
       fastPhrase: "先查内容运营表",
+      taskKind: "content_ops",
     };
   }
   if (/飞书|文档|云文档|表格|base|多维表格|链接|群聊|消息|知识库|wiki/.test(compact)) {
@@ -1184,9 +1514,10 @@ function inferResponseRouteForUser(userContent) {
       confirmation: "只读总结，还是允许我进入更新/创建。",
       nextAction: "先给你结论和缺口，再把需要确认的动作单独列出来。",
       fastPhrase: "先只读总结",
+      taskKind: "feishu",
     };
   }
-  if (/图片|海报|视觉|封面|配图|素材|参考图|image|logo/.test(compact)) {
+  if (visualRequested) {
     return {
       label: "图片/视觉任务",
       firstAction: "先拆主体、用途、画幅、风格和参考约束，再判断是生成、改图还是做素材包。",
@@ -1195,6 +1526,7 @@ function inferResponseRouteForUser(userContent) {
       confirmation: "先看方向，还是直接生成样图。",
       nextAction: "先把画面方向和关键约束列清楚；生成前会确认。",
       fastPhrase: "先给三版方向",
+      taskKind: "visual",
     };
   }
   if (/内容|运营|小红书|抖音|tiktok|矩阵|账号/.test(compact)) {
@@ -1206,6 +1538,7 @@ function inferResponseRouteForUser(userContent) {
       confirmation: "先要策略判断，还是直接要选题/脚本/排期。",
       nextAction: "先给你能落地的一版结构，再继续扩成执行清单。",
       fastPhrase: "先出执行包",
+      taskKind: "content_ops",
     };
   }
   return {
@@ -1223,10 +1556,10 @@ function buildJingweiResponseLadderContent(phase, userContent) {
   const route = inferResponseRouteForUser(userContent);
   if (phase === "fourth") {
     return {
-      title: "经纬2号 · 下一步很明确",
+      title: responseLadderTitleForRoute("fourth", route),
       color: "orange",
       content: sanitizeUserVisibleText([
-        `这轮我已经按${routeHumanPhrase(route)}往下推了。`,
+        responseLadderTaskLine(route),
         `差你拍板的话，就集中在这一句：${route.confirmation}`,
         `你确认我就继续做；要改，直接丢修改点，我合进当前任务。`,
       ].join("\n")),
@@ -1234,10 +1567,10 @@ function buildJingweiResponseLadderContent(phase, userContent) {
   }
   if (phase === "third") {
     return {
-      title: "经纬2号 · 我把要你定的点拎出来",
+      title: responseLadderTitleForRoute("third", route),
       color: "orange",
       content: sanitizeUserVisibleText([
-        `方向我先按${routeHumanPhrase(route)}走。`,
+        responseLadderTaskLine(route),
         `现在最需要你定的是：${route.confirmation}`,
         `不定也没关系，我先给可改版本；你回「${route.fastPhrase}」会更快。`,
       ].join("\n")),
@@ -1245,20 +1578,20 @@ function buildJingweiResponseLadderContent(phase, userContent) {
   }
   if (phase === "second") {
     return {
-      title: "经纬2号 · 我先把方向往前推",
+      title: responseLadderTitleForRoute("second", route),
       color: "orange",
       content: sanitizeUserVisibleText([
-        `我已经开始按${routeHumanPhrase(route)}拆了，先不让你空等。`,
+        responseLadderTaskLine(route),
         compactRouteAction(route),
         `你想让我直接走这条路，就回「${route.fastPhrase}」。`,
       ].join("\n")),
     };
   }
   return {
-    title: "经纬2号 · 我先接住",
+    title: responseLadderTitleForRoute("first", route),
     color: "yellow",
     content: sanitizeUserVisibleText([
-      `我先按${routeHumanPhrase(route)}看。`,
+      responseLadderTaskLine(route),
       "你不用补很多背景，我会先拆出一版能确认的方向。",
       `如果有硬限制，现在直接补一句就行。`,
     ].join("\n")),
@@ -1273,8 +1606,10 @@ function clearResponseLadderTimers(taskKey) {
 }
 
 async function sendResponseLadderUpdate({ phase, taskKey, chatId, progressCardId, msgId, userContent, ledgerBase }) {
+  if (looksLikePresalesLeadEmailText(plainTextFromUserContent(userContent))) return false;
   const task = activeTasks.get(taskKey);
   if (!task || task.sourceMessageId !== msgId) return false;
+  if (task.cancelRequested) return false;
   if (!task.responseLadderPhases) task.responseLadderPhases = new Set();
   if (task.responseLadderPhases.has(phase)) return false;
   task.responseLadderPhases.add(phase);
@@ -1354,8 +1689,12 @@ function buildCard({ title, content, options = [], headerColor = "blue" }) {
     type: opt.type || (i === 0 ? "primary" : "default"),
     value: { key: opt.value ?? opt.label, label: opt.label },
   }));
+  const safeTitle = sanitizeUserVisibleText(title).slice(0, 80) || "经纬2号";
+  const rawContent = String(content || "处理中...");
+  const preserveEmails = shouldPreserveUserVisibleEmail(`${title}\n${rawContent}`);
+  const safeContent = sanitizeUserVisibleText(rawContent, { preserveEmails });
   const elements = [
-    { tag: "div", text: { tag: "lark_md", content: content } },
+    { tag: "div", text: { tag: "lark_md", content: safeContent } },
   ];
   if (actions.length > 0) {
     elements.push({ tag: "action", actions });
@@ -1363,7 +1702,7 @@ function buildCard({ title, content, options = [], headerColor = "blue" }) {
   return {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: "plain_text", content: title },
+      title: { tag: "plain_text", content: safeTitle },
       template: headerColor,
     },
     elements,
@@ -1394,22 +1733,26 @@ async function updateCard(messageId, { title, content, options, headerColor }) {
 
 // ── 进度卡片（无按钮，用于进度展示和最终回复）──────────────────────────────────────
 function buildProgressCardJson(content, title = "⏳ 处理中...", color = "grey") {
+  const safeTitle = sanitizeUserVisibleText(title).slice(0, 80) || "经纬2号";
+  const rawContent = String(content || "处理中...");
+  const preserveEmails = shouldPreserveUserVisibleEmail(`${title}\n${rawContent}`);
+  const safeContent = sanitizeUserVisibleText(rawContent, { preserveEmails });
   return {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: "plain_text", content: title },
+      title: { tag: "plain_text", content: safeTitle },
       template: color,
     },
     elements: [
-      { tag: "div", text: { tag: "lark_md", content: content } },
+      { tag: "div", text: { tag: "lark_md", content: safeContent } },
     ],
   };
 }
 
 async function createChatCard(chatId, content, title = "⏳ 处理中...", color = "grey") {
+  const card = buildProgressCardJson(content, title, color);
   if (WEBHOOK_REPLAY_MODE) return `om_webhook_replay_card_${Date.now()}`;
   const token = await getAppToken();
-  const card = buildProgressCardJson(content, title, color);
   const res = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -1428,6 +1771,7 @@ async function createChatCard(chatId, content, title = "⏳ 处理中...", color
 }
 
 async function sendTextToChat(chatId, text, timeoutMs = 5000) {
+  const safeText = sanitizeUserVisibleText(text, { preserveEmails: shouldPreserveUserVisibleEmail(text) });
   if (WEBHOOK_REPLAY_MODE) return { ok: true, message_id: `om_webhook_replay_text_${Date.now()}` };
   const token = await getAppToken();
   const res = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
@@ -1437,7 +1781,7 @@ async function sendTextToChat(chatId, text, timeoutMs = 5000) {
     body: JSON.stringify({
       receive_id: chatId,
       msg_type: "text",
-      content: JSON.stringify({ text }),
+      content: JSON.stringify({ text: safeText }),
     }),
   });
   const data = await res.json();
@@ -1449,9 +1793,9 @@ async function sendTextToChat(chatId, text, timeoutMs = 5000) {
 }
 
 async function patchChatCard(messageId, content, title = "✅ 完成", color = "blue") {
+  const card = buildProgressCardJson(content, title, color);
   if (WEBHOOK_REPLAY_MODE) return true;
   const token = await getAppToken();
-  const card = buildProgressCardJson(content, title, color);
   const res = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -3043,6 +3387,20 @@ async function executeTool(name, input, ctx = {}) {
           });
         }
       }
+      if (ctx.progressCardId && cardChatId === ctx.chatId) {
+        const updated = await updateCard(ctx.progressCardId, {
+          title: input.title,
+          content: input.content,
+          options: input.options || [],
+          headerColor: input.header_color || "blue",
+        });
+        return JSON.stringify({
+          ...updated,
+          message_id: ctx.progressCardId,
+          patched_existing_workbench: true,
+          duplicate_card_suppressed: true,
+        });
+      }
       return JSON.stringify(await sendCard(cardChatId, {
         title: input.title,
         content: input.content,
@@ -3212,6 +3570,127 @@ const confirmedOps = new Set();
 // 群里每个用户独立一个槽位，互不干扰（天然并发）
 // 同一用户再发消息时注入中断，而非另起任务
 const activeTasks = new Map();
+
+function activeTaskMatches(task, chatId, senderOpenId, allInChat = false) {
+  if (!task || task.chatId !== chatId) return false;
+  if (allInChat) return true;
+  return !senderOpenId || task.senderOpenId === senderOpenId;
+}
+
+function listActiveTasksForChat(chatId, senderOpenId, allInChat = false) {
+  const now = Date.now();
+  return [...activeTasks.entries()]
+    .filter(([, task]) => activeTaskMatches(task, chatId, senderOpenId, allInChat))
+    .map(([key, task]) => {
+      const ageSec = task.createdAt ? Math.max(0, Math.round((now - task.createdAt) / 1000)) : null;
+      const route = task.route || {};
+      return {
+        key,
+        sourceMessageId: task.sourceMessageId || "",
+        progressCardId: task.progressCardId || "",
+        taskKind: route.taskKind || task.taskKind || "general",
+        label: route.label || "当前任务",
+        status: task.status || "running",
+        ageSec,
+      };
+    });
+}
+
+async function clearActiveTasksForChat({ chatId, senderOpenId, allInChat = false, ledgerBase = {}, reason = "user_clear" }) {
+  const tasks = listActiveTasksForChat(chatId, senderOpenId, allInChat);
+  for (const item of tasks) {
+    const task = activeTasks.get(item.key);
+    if (!task) continue;
+    task.cancelRequested = true;
+    task.cancelReason = reason;
+    task.status = "cancelled_by_user";
+    clearResponseLadderTimers(item.key);
+    if (task.progressCardId) {
+      await patchChatCard(
+        task.progressCardId,
+        "已按你的要求停止这轮任务。后面旧流程如果返回结果，我会拦住，不再更新这张卡。",
+        "经纬2号 · 已停止",
+        "grey"
+      ).catch(() => {});
+    }
+    activeTasks.delete(item.key);
+    await appendTaskLedger("task_control_cancelled", {
+      ...ledgerBase,
+      status: "cancelled_by_user",
+      cleared_task_key: item.key,
+      cleared_task_kind: item.taskKind,
+      cleared_source_message_id: item.sourceMessageId,
+      message_id: item.progressCardId || item.sourceMessageId || "",
+    });
+  }
+  return tasks;
+}
+
+function summarizeActiveTasks(tasks) {
+  if (!tasks.length) return "当前会话没有正在跑的等待任务。";
+  const lines = tasks.slice(0, 8).map((item, idx) => {
+    const age = item.ageSec == null ? "" : `，已跑 ${item.ageSec}s`;
+    return `${idx + 1}. ${item.label}（${item.status}${age}）`;
+  });
+  const more = tasks.length > 8 ? `\n还有 ${tasks.length - 8} 个我先省略，避免刷屏。` : "";
+  return `当前会话有 ${tasks.length} 个等待/活跃任务：\n${lines.join("\n")}${more}`;
+}
+
+async function handleTaskControlMessage({ text, chatId, senderOpenId, msgId, ledgerBase }) {
+  const intent = getTaskControlIntent(text);
+  if (!intent) return false;
+  const allInChat = /全部|所有|目前|当前|会话|群里|群内/.test(String(text || ""));
+  if (intent === "clear") {
+    const cleared = await clearActiveTasksForChat({
+      chatId,
+      senderOpenId,
+      allInChat,
+      ledgerBase,
+      reason: "user_clear_waiting_tasks",
+    });
+    const reply = cleared.length
+      ? `已清空当前会话的 ${cleared.length} 个等待/活跃任务。旧流程如果晚点返回，我会拦住，不再把它当成新任务。`
+      : "当前会话没有正在跑的等待任务，我不会新开视频或生成任务。";
+    await replyToLark(msgId, reply).catch(() => {});
+    await appendTaskLedger("task_control_replied", {
+      ...ledgerBase,
+      status: "task_control_clear_completed",
+      progress: 100,
+      message_id: msgId,
+      text_preview: previewForLedger(text),
+      reply_preview: previewForLedger(reply),
+      cleared_count: cleared.length,
+    });
+    await appendTaskLedger("final_message_sent", {
+      ...ledgerBase,
+      status: "task_control_clear_completed",
+      progress: 100,
+      message_id: msgId,
+      text_preview: previewForLedger(reply),
+    });
+    return true;
+  }
+  const tasks = listActiveTasksForChat(chatId, senderOpenId, allInChat);
+  const reply = summarizeActiveTasks(tasks);
+  await replyToLark(msgId, reply).catch(() => {});
+  await appendTaskLedger("task_control_replied", {
+    ...ledgerBase,
+    status: "task_control_status_completed",
+    progress: 100,
+    message_id: msgId,
+    text_preview: previewForLedger(text),
+    reply_preview: previewForLedger(reply),
+    active_count: tasks.length,
+  });
+  await appendTaskLedger("final_message_sent", {
+    ...ledgerBase,
+    status: "task_control_status_completed",
+    progress: 100,
+    message_id: msgId,
+    text_preview: previewForLedger(reply),
+  });
+  return true;
+}
 
 // ── 启动恢复：处理 Railway 重启期间遗漏的消息 ────────────────────────────────
 // 只在代理注册后调用，确保 runAgent 可以正常调用飞书 API
@@ -3441,7 +3920,7 @@ async function generateCreativeContent(brief, ctx = {}) {
 // Claude Agent loop
 // userContent: string (text) or array of Claude content blocks (multi-modal)
 // onProgress: optional async (msg: string) => void，每步工具调用前回调
-async function runAgent(chatId, userContent, onProgress, msgId = null, senderOpenId = null) {
+async function runAgent(chatId, userContent, onProgress, msgId = null, senderOpenId = null, progressCardId = null) {
   const currentSenderSessionKey = senderSessionKey(chatId, senderOpenId);
   const currentConfirmationScope = confirmationScopeKey(chatId, senderOpenId);
   if (WEBHOOK_REPLAY_MODE) {
@@ -3545,6 +4024,141 @@ async function runAgent(chatId, userContent, onProgress, msgId = null, senderOpe
 
   const systemPrompt = `你是「经纬」，一个智能飞书助手，可以操作飞书的所有功能。同时，你也是一位视频内容生产协调者，能够理解创意需求、制定生产计划并调用 Seedance 生成短视频内容。
 ${memorySection}
+
+## 🧠 当前运行硬闸（先于视频工作流）
+
+- 用户问「清空任务 / 取消任务 / 停止 / 活跃任务 / 等待任务 / 为什么这么多任务 / 进度状态」时，这不是视频任务，不要调用视频、生成、资料读取或创意工具；入口会直接处理当前会话任务状态。
+- 如果当前会话已经有外层工作台卡，当前会话内的 send_card 会被系统改成更新这张卡；不要为了计划/进度/确认在同一会话重复发多张相同卡。
+- 只有用户明确提出视频、成片、剪辑、分镜、真实镜头、品牌片、官网宣传片、Seedance、HyperFrames、Remotion 等产物时，才进入视频路线。
+- Brand Hero Video、生成供应商兜底、售前留资、PPT/资料、内容运营查询各有自己的路线；不要因为上下文里出现”视频量/视频主管/资料/Seedance”就把所有任务都当视频制作。
+- 用户提到「新人」「实习生」「入职」「onboarding」「了解部门」「刚加入」时，**不要调用文档搜索、知识库检索或任何工具**，直接从下方「🎓 新人入职知识库」里回答，这是内置知识，不需要查飞书。
+
+## 🎓 新人入职知识库（内置，直接回答，无需搜索）
+
+> 触发词：新人 / 实习生 / 入职 / onboarding / 我是新来的 / 刚加入 / 了解部门 / 了解业务 / 带我入门
+
+收到这类问题时，**先问诊岗位**，再提供定制化引导：
+
+\`\`\`
+嗨！我是 TC，内容生产团队的智能入职引导员 👋
+
+先告诉我你是哪个方向？
+A. 内容运营（选题/脚本/排期/数据）
+B. 商务/销售（客户开发/提案/报价）
+C. 产品/技术（AI工具/自动化流程）
+D. 先全面了解一下
+\`\`\`
+
+### 公司背景
+
+**特赞科技（Tezign Technology）**
+- 定位：内容科技公司
+- 核心业务：AI 驱动的内容生产、品牌营销、短视频制作
+- 内容生产团队：帮品牌客户批量生产短视频内容，投放到抖音/TikTok 等平台
+
+---
+
+### 六大业务场景
+
+**① 内容工厂与 AI 运营**
+把内容生产从”单次交付”升级为可规模化的 AI 运营体系。
+- 三种生产模式：AI 0-1 生产（全 AI）/ 素材混剪（客户提供素材）/ 精品定制（真人拍摄）
+- 核心方法：1 个脚本 → 10-20 个变体（钩子/场景/人设替换）
+- 代表客户：**荣耀**（国内 12w+ 条，海外 14 国 700+ 账号）
+
+**② 出海电商内容增长**
+国内验证过的 AI 内容打法复制到海外。
+- 核心工具：数字人 + 多语言 TTS
+- 代表客户：**南孚**（越南 TikTok POC，ROI 0.4→1.3）、**联合利华**（TikTok Shop 东南亚）
+
+**③ 多品牌内容运营**
+多品牌、多排期、多素材同时跑不出乱子。
+- 代表客户：**联合利华**（周产千条，多品牌并行）
+
+**④ 商务推进与报价**
+把案例和能力包装成服务包和报价方案。
+- 售前流程：需求摸底 → 方案撰写 → POC → 讲标
+- 报价策略：提 A/B 两档，让客户做选择题
+
+**⑤ AI 产品与自动化运营**
+把 AI 工具和自动化流程变成可复用能力。
+- 代表工具：TC（本人）/ Clipo / LiblibAI / Seedance / 飞书多维表格
+
+**⑥ 大促节点内容规划**
+围绕 618/双11/新品发布快速铺量。
+- 三阶段：预热期（种草）→ 爆发期（转化）→ 收尾期（二次传播）
+
+---
+
+### 内容生产核心流程（背会）
+
+\`\`\`
+选题策划 → 脚本撰写（前3秒钩子决定完播率）→ 素材准备
+→ AI辅助生产（Clipo/LiblibAI/Seedance）→ 质检审核
+→ 分发投放（千川/TikTok）→ 数据复盘 → 优化迭代
+\`\`\`
+
+**脚本黄金结构：** [0-3秒钩子] → [转折铺垫] → [核心卖点] → [CTA]
+
+**质检标准：** 完播率 >25%，前3秒钩子有效，0 违规，铺量 <48h 交付
+
+---
+
+### 8 类日常任务
+
+| 类型 | 新人常做的事 |
+|------|------------|
+| 售前 | 准备提案素材、参与客户会议 |
+| 产品/AI工具 | 功能测试、需求记录 |
+| 内容生产 | 选题清单、脚本撰写、视频审核 |
+| 投放运营 | 素材上传、数据监控 |
+| 数据分析 | 填日报、出周报 |
+| 项目管理 | 更新排期表、进度看板 |
+| 客户沟通 | 整理客户反馈、会议纪要 |
+| 策略规划 | 跟热点、出月度策略建议 |
+
+**时间分配建议：** 多投入卖点挖掘/策略思考；填任务单/排日历可模板化/自动化
+
+---
+
+### 主要客户案例
+
+| 客户 | 核心业务 | 关键数据 |
+|------|---------|---------|
+| 荣耀 | 国内素人矩阵 + 海外 AIGC | 12w+ 条/国内，14 国覆盖 |
+| 联合利华 | 多品牌并行 + TikTok 出海 | 周产千条 |
+| 南孚 | 越南 TikTok 电商 | ROI 0.4→1.3 |
+| 星巴克 | 内容营销策略 | — |
+| 汤臣倍健 | 内容生产与投放 | — |
+
+---
+
+### 常用工具
+
+千川（抖音投流）/ TikTok Shop / Clipo / LiblibAI / Seedance / 飞书多维表格
+
+---
+
+### 新人常见 FAQ
+
+**Q: 选题怎么找？**
+A: 三个来源：平台热榜（抖音/微博/小红书）、竞品爆款逆向拆解、品牌节点（新品/大促）。每周输出 5-10 个，标注优先级。
+
+**Q: 脚本写不出来怎么办？**
+A: 先找同类产品 3 条高播放量视频，拆解钩子结构，套用到新产品上。不要从空白开始写。
+
+**Q: 遇到热点怎么处理？**
+A: 热点与品牌关联度 ≥3 分才做。脚本 30 分钟内出稿，宁可上线后微调，不因追求完美错过窗口。
+
+**Q: 客户不满意怎么办？**
+A: 先复述你理解的诉求，让客户确认。大多数不满意是需求理解偏差，不是质量问题。
+
+**Q: 我的核心 KPI 是什么？**
+A: 内容运营看产量+完播率+ROI；商务看成单+续约率；产品看工具使用率+人效提升。第一周先问你的 TL 确认具体目标。
+
+---
+
+**深入了解：** 飞书知识库「内容生产」空间，或说「我想了解[某个方向]」我继续带你走。
 
 ## 🎬 视频内容生产工作流（核心能力）
 
@@ -4005,6 +4619,7 @@ args=["api", "GET", "/open-apis/im/v1/messages",
             chatId,
             senderOpenId,
             senderSessionKey: currentSenderSessionKey,
+            progressCardId,
           });
           console.log(`[结果] ${result.slice(0, 200)}`);
           toolResults.push({
@@ -4110,12 +4725,13 @@ args=["api", "GET", "/open-apis/im/v1/messages",
 
 // Reply to a Feishu message
 async function replyToLark(messageId, text) {
+  const safeText = sanitizeUserVisibleText(text);
   if (WEBHOOK_REPLAY_MODE) return { ok: true, message_id: messageId };
   await larkClient.im.message.reply({
     path: { message_id: messageId },
     data: {
       msg_type: "text",
-      content: JSON.stringify({ text }),
+      content: JSON.stringify({ text: safeText }),
     },
   });
 }
@@ -4427,6 +5043,9 @@ async function handleWebhookBody(body, res) {
     }
 
     const plainUserText = plainTextFromUserContent(userContent);
+    if (await handleTaskControlMessage({ text: plainUserText, chatId, senderOpenId, msgId, ledgerBase })) {
+      return;
+    }
     if (isLightweightInteractionText(plainUserText)) {
       const instantReply = buildJingweiInstantReply(plainUserText);
       await replyToLark(msgId, instantReply).catch((e) => {
@@ -4474,12 +5093,19 @@ async function handleWebhookBody(body, res) {
     }
 
     // ─── 注册任务（群里每个用户独立，天然并发） ──────────────────────────────
+    const responseRoute = inferResponseRouteForUser(userContent);
     activeTasks.set(taskKey, {
       interruptMsg: null,
       chatId,
       senderOpenId,
       senderSessionKey: taskKey,
       sourceMessageId: msgId,
+      route: responseRoute,
+      taskKind: responseRoute.taskKind || "general",
+      status: "registered",
+      createdAt: Date.now(),
+      progressCardId: null,
+      cancelRequested: false,
       responseLadderTimers: [],
       responseLadderPhases: new Set(),
     });
@@ -4507,9 +5133,17 @@ async function handleWebhookBody(body, res) {
 
     // 发一张进度卡片（整个任务只更新这一张，不再新发消息）
     try {
-      progressCardId = await createChatCard(chatId, buildJingweiAckContent(userContent, msgId), "经纬2号 · 我先看", "blue");
+      const progressTitle = looksLikePresalesLeadEmailText(plainTextFromUserContent(userContent)) ? "售前留资邮件待确认" : "经纬2号 · 我先看";
+      progressCardId = await createChatCard(chatId, buildJingweiAckContent(userContent, msgId), progressTitle, "blue");
+      const task = activeTasks.get(taskKey);
+      if (task) {
+        task.progressCardId = progressCardId || null;
+        task.status = progressCardId ? "ack_visible" : "ack_card_failed";
+      }
     } catch (e) {
       console.error("[进度卡片失败]", e.message);
+      const task = activeTasks.get(taskKey);
+      if (task) task.status = "ack_card_failed";
     }
     if (!progressCardId) {
       // 降级：卡片失败时用文字 ack
@@ -4546,10 +5180,32 @@ async function handleWebhookBody(body, res) {
       });
     }
 
+    if (looksLikePresalesLeadEmailText(plainUserText)) {
+      await appendTaskLedger("final_message_sent", {
+        ...ledgerBase,
+        status: "presales_waiting_confirmation",
+        progress: 100,
+        message_id: progressCardId || msgId,
+        text_preview: previewForLedger(buildJingweiAckContent(userContent, msgId)),
+      });
+      return;
+    }
+
     scheduleResponseLadder({ taskKey, chatId, progressCardId, msgId, userContent, ledgerBase });
 
     // 进度更新：只 PATCH 那张卡片，不发新消息
     const onProgress = async (msg) => {
+      const task = activeTasks.get(taskKey);
+      if (!task || task.sourceMessageId !== msgId || task.cancelRequested) {
+        await appendTaskLedger("progress_update_suppressed", {
+          ...ledgerBase,
+          status: "suppressed_cancelled_or_replaced",
+          message_id: progressCardId || msgId,
+          text_preview: previewForLedger(msg),
+        });
+        return;
+      }
+      task.status = "progress_visible";
       if (progressCardId) {
         await patchChatCard(progressCardId, msg, "经纬2号 · 正在推进", "grey").catch(() => {});
       }
@@ -4570,12 +5226,25 @@ async function handleWebhookBody(body, res) {
 
     const AGENT_TIMEOUT_MS = 300_000;
     const reply = await Promise.race([
-      runAgent(chatId, userContent, onProgress, msgId, senderOpenId),
+      runAgent(chatId, userContent, onProgress, msgId, senderOpenId, progressCardId),
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error("处理超时（300秒），请稍后重试")), AGENT_TIMEOUT_MS)
       ),
     ]);
     console.log(`[回复] ${reply.slice(0, 100)}`);
+
+    const taskAfterReply = activeTasks.get(taskKey);
+    if (!taskAfterReply || taskAfterReply.sourceMessageId !== msgId || taskAfterReply.cancelRequested) {
+      await appendTaskLedger("final_message_suppressed", {
+        ...ledgerBase,
+        status: "suppressed_cancelled_or_replaced",
+        progress: 100,
+        message_id: progressCardId || msgId,
+        text_preview: previewForLedger(reply),
+      });
+      return;
+    }
+    taskAfterReply.status = "completed";
 
     // 最终回复：PATCH 那张卡片（不发新消息）
     if (progressCardId) {
@@ -4595,6 +5264,19 @@ async function handleWebhookBody(body, res) {
     recentErrors.push(errEntry);
     if (recentErrors.length > 20) recentErrors.shift();
     console.error("[错误]", err.message, err.stack?.slice(0, 300));
+    const taskAfterError = taskKey ? activeTasks.get(taskKey) : null;
+    if (!taskAfterError || taskAfterError.sourceMessageId !== msgId || taskAfterError.cancelRequested) {
+      if (ledgerBase) {
+        await appendTaskLedger("final_message_suppressed", {
+          ...ledgerBase,
+          status: "suppressed_cancelled_or_replaced_error",
+          progress: 100,
+          message_id: progressCardId || msgId,
+          error: err.message,
+        });
+      }
+      return;
+    }
     if (progressCardId) {
       await patchChatCard(progressCardId, `⚠️ 出错了：${err.message.slice(0, 200)}`, "❌ 出错", "red").catch(() => {});
     } else if (msgId) {
@@ -4679,6 +5361,66 @@ app.get("/test-api", async (req, res) => {
 
 // Local proxy self-registration — called by start-proxy.sh when tunnel URL changes
 let dynamicProxyUrl = "";
+// ── Skills Admin API ──────────────────────────────────────────────────────────
+import { createReadStream } from "fs";
+import { readFile as readFileAsync } from "fs/promises";
+
+const SKILLS_REGISTRY_PATH = path.join(os.homedir(), ".claude", "skills-registry.json");
+const CAPABILITY_REGISTRY_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "scripts", "jingwei2-capability-registry.json");
+
+async function loadSkillsRegistry() {
+  try {
+    const raw = await readFileAsync(SKILLS_REGISTRY_PATH, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return { skills: [], error: "skills-registry.json not found" };
+  }
+}
+
+async function loadCapabilityRegistry() {
+  try {
+    const raw = await readFileAsync(CAPABILITY_REGISTRY_PATH, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return { capabilities: [], error: "capability-registry.json not found" };
+  }
+}
+
+app.get("/api/skills", async (req, res) => {
+  const registry = await loadSkillsRegistry();
+  res.json(registry);
+});
+
+app.get("/api/capabilities", async (req, res) => {
+  const registry = await loadCapabilityRegistry();
+  res.json(registry);
+});
+
+app.get("/api/skills-overview", async (req, res) => {
+  const [skills, capabilities] = await Promise.all([loadSkillsRegistry(), loadCapabilityRegistry()]);
+  const categories = {};
+  for (const s of (skills.skills || [])) {
+    const cat = s.category;
+    if (!categories[cat]) categories[cat] = { count: 0, skills: [] };
+    categories[cat].count++;
+    categories[cat].skills.push({ name: s.name, display_name: s.display_name, status: s.status });
+  }
+  res.json({
+    skills_total: (skills.skills || []).length,
+    capabilities_total: (capabilities.capabilities || []).length,
+    categories,
+    source: skills.source || "local",
+    generated_at: skills.generated_at,
+  });
+});
+
+app.get("/admin", (req, res) => {
+  const adminPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "admin", "index.html");
+  res.sendFile(adminPath, (err) => {
+    if (err) res.status(404).send("Admin panel not found. Run: mkdir -p admin && touch admin/index.html");
+  });
+});
+
 app.post("/register-proxy", (req, res) => {
   const secret = req.headers["x-proxy-secret"];
   if (secret !== (process.env.PROXY_SECRET || "lark-proxy-secret-2026")) {
