@@ -1146,6 +1146,7 @@ function routeHumanPhrase(route = {}) {
   const label = route.label || "";
   if (/售前留资|官网留资/.test(label) || route.taskKind === "presales_lead_email") return "Clipo 官网售前留资邮件转化";
   if (route.taskKind === "task_control") return "当前任务状态";
+  if (route.taskKind === "onboarding") return "新人入职引导";
   if (route.taskKind === "generation_provider_fallback") return "生成能力兜底这条线";
   if (route.taskKind === "brand_hero_video") return "品牌 Hero Video 这条线";
   if (/客户|邮件|外联/.test(label)) return "客户跟进这条线";
@@ -1372,6 +1373,18 @@ function buildJingweiTaskPreAckText(userContent, queued = false) {
 function inferResponseRouteForUser(userContent) {
   const text = plainTextFromUserContent(userContent);
   const compact = String(text || "").toLowerCase();
+  if (/新人|实习生|入职|onboarding|刚加入|刚入职|了解部门|了解业务|带我入门|我是新来的|第一天|第一周/.test(compact)) {
+    return {
+      label: "新人入职引导",
+      firstAction: "直接从内置入职知识库回答，不调用任何工具，先问清楚岗位方向再提供定制化引导。",
+      supplement: "告诉我你是内容运营、商务销售、还是产品技术方向，我给你最适合的学习路线。",
+      secondState: "我会介绍团队业务、生产流程、日常任务类型和主要客户，不需要搜索飞书文档。",
+      confirmation: "先告诉我你的岗位方向，A内容运营 B商务销售 C产品技术 D先全面了解。",
+      nextAction: "先问诊岗位，再提供定制化入职路线和业务知识。",
+      fastPhrase: "先介绍团队业务",
+      taskKind: "onboarding",
+    };
+  }
   if (getTaskControlIntent(text)) {
     return {
       label: "当前任务状态/控制",
